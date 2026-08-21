@@ -407,7 +407,7 @@ def fit_core(sessions, rng):
     wsum = wm.sum(1)[order]      # act[t] = sessions still running at t
     act = np.bincount(np.minimum(ls, T), minlength=T + 1)[::-1].cumsum()[::-1][1:]
 
-    acti = [int(v) for v in act]
+    acti = act.tolist()
     # every (t, session-still-running) pair, packed once. The per-step blocks below are VIEWS into
     # it, so the ten quantities that do not read a state -- the two powers, the two exponentials
     # and their arithmetic -- are computed in one vectorised pass instead of 5553 short ones.
@@ -619,6 +619,9 @@ POLICY_BOUNDS = np.array([
 ])
 POLICY_SPAN = POLICY_BOUNDS[:, 1] - POLICY_BOUNDS[:, 0]   # the box's width, once: three copies of
                                                      # this normalisation drift otherwise
+EASE_SPAN = 0.25  # fraction of `span` the ease stroke drives. Crosses the grade/actuate
+                  # boundary: setpoints() decides what a cycle is GRADED against and next_action
+                  # decides what the toy DOES, and nothing gates that pair against each other.
 BAND_MIN = 0.05   # a policy whose ease stroke drives almost as hard as its build stroke still gets
                   # somewhere to turn around -- half a keypress level -- rather than a zero-width
                   # band that opens and closes on the same command.
@@ -715,10 +718,12 @@ def setpoints(P, core, rate_ref=None):
     same rate_ref convention as CoreStreamer.step, because a ceiling quoted for a different
     stimulus than the one the streamer integrates is not this machine's ceiling. The deadline used
     to answer "can this policy get there?" by burning 300 seconds of his evening first."""
-    a, b, tauE, g, thr, rho, lam, kH, hH, dH = (float(core[k]) for k in CORE_NAMES)
+    # _tauE is unpacked and deliberately unused: this solves where the states SETTLE, and a
+    # fixed point has no time constant. The name says so rather than reading as an oversight.
+    a, b, _tauE, g, thr, rho, lam, kH, hH, dH = (float(core[k]) for k in CORE_NAMES)
     aim, rel, lo, span, dur_hi, dur_lo, _, lfo_d = np.asarray(P, float).T
-    tb = np.minimum(1.0, lo + span) - lo
-    te = np.minimum(1.0, lo + 0.25 * span) - lo
+    hib, hie = np.minimum(1.0, lo + span), np.minimum(1.0, lo + EASE_SPAN * span)
+    tb, te = hib - lo, hie - lo
     # The LFO-AVERAGE half-stroke, not its shortest: a ceiling is what a stimulus held forever
     # reaches, and dur_hi*(1-lfo_d) is touched for an instant at the top of each sweep.
     db, de_ = dur_hi * (1 - 0.5 * lfo_d), dur_lo * (1 + 0.5 * lfo_d)
@@ -760,11 +765,29 @@ def setpoints(P, core, rate_ref=None):
         # disagreeing with itself.
         onepass = kH == 0.0 or hH == 0.0
         A = H = np.zeros_like(P_)
-        for _ in range(1 if onepass else 64):
-            de = np.logaddexp(0.0, g * (P_ - thr - kH * H))
-            A2 = rho * de / (rho * de + lam)
-            H = H + 0.25 * (hH * A2 / dH - H)
-            A = A2
+        if onepass:
+            de = softplus(g * (P_ - thr - kH * H))
+            A = rho * de / (rho * de + lam)
+        else:
+            # BISECTION, not a damped iteration. A_ss is strictly DECREASING in A wherever H can
+            # feed back (de falls as kH*hH*A/dH rises), so the fixed point is unique and bracketed
+            # by [0,1]: 60 halvings put it below double precision at a FIXED pass count -- the same
+            # determinism a singleton and a batch need from each other, measured at exactly 0.0 --
+            # and unlike the damped map it is also the RIGHT answer. The fixed count was a fix at
+            # the wrong depth: it bought determinism and left the number wrong. Measured against
+            # the recurrence this claims to solve, the damped form missed the build ceiling by up
+            # to 0.19 -- 1.7 keypress levels, into what _band grades a cycle against -- on 14% of
+            # the policy box at a core drawn from CORE_BOUNDS. Bisection: 8.9e-13, and no slower.
+            c = kH * hH / dH
+            lo_, hi_ = np.zeros_like(P_), np.ones_like(P_)
+            for _ in range(60):
+                mid = 0.5 * (lo_ + hi_)
+                f = softplus(g * (P_ - thr - c * mid))
+                f = rho * f / (rho * f + lam)
+                below = f < mid
+                hi_ = np.where(below, mid, hi_); lo_ = np.where(below, lo_, mid)
+            A = 0.5 * (lo_ + hi_)
+            de = softplus(g * (P_ - thr - c * A))
         # `rho*de + lam` IS the k that goes with the A being returned -- A = rho*de/(rho*de+lam)
         # by the line above, in BOTH branches. Recomputing it from the post-loop H made the
         # non-shortcut arm quote a rate one iteration ahead of its own A: measured 143x off at the
@@ -772,8 +795,8 @@ def setpoints(P, core, rate_ref=None):
         # core in both suites has hH == 0.0), which is how it stayed wrong.
         return A, rho * de + lam
 
-    hiA, kb = settle(np.minimum(1.0, lo + span), tb, db)
-    loA, ke = settle(np.minimum(1.0, lo + 0.25 * span), te, de_)
+    hiA, kb = settle(hib, tb, db)
+    loA, ke = settle(hie, te, de_)
     hiA = np.maximum(hiA, loA + BAND_MIN)
     tgt = loA + aim * (hiA - loA)
     return loA, hiA, tgt, loA + rel * (tgt - loA), kb, ke, tb, db, te, de_
@@ -833,9 +856,17 @@ ENCODER = CKPT + "/encoder.json"
 
 RLS_SIGMA, RLS_P0, RLS_Q, NN_CAND = 0.25, 1.0, 1e-4, 48
 NF_ENC, NH_ENC, HIST_ENC, RECENT_CELLS = 32, 24, 6, 8   # feature width, cycles the encoder reads, anti-repeat
+HROW, HROW_T = len(POLICY_NAMES) + 3, 9   # hist_row's width, and the column the CfC's time gate reads. cfc_features
+                          # and Enc.phi must index the SAME one or the gate is fed a knob.
+
+LECUN_A, LECUN_B = 1.7159, 0.666   # ONE pair for the two written copies of this activation:
+                                   # lecun() is the numpy/live half, Cell.forward in
+                                   # train_encoder is the torch/train half, and a weight trained
+                                   # under one and evaluated under the other fails silently.
+
 
 def lecun(x):
-    return 1.7159 * np.tanh(0.666 * x)
+    return LECUN_A * np.tanh(LECUN_B * x)
 
 def load_encoder(predictor_hash, say=print):
     """The exported CfC, or None with a REASON. Never returns None quietly: if the online head is
@@ -859,39 +890,54 @@ def load_encoder(predictor_hash, say=print):
         say(f"online learning OFF -- {ENCODER} is malformed "   # then printed "reason above" with
             f"({type(ex).__name__}: {ex}). Rebuild it with `train`.")   # no reason above it
         return None
-    # Check the weights the forward pass will actually index, HERE. The recurrent loop only runs
-    # once a cycle has closed, so a missing cell.* key used to pass every check, print "online
-    # learning ON", drive the toy, and raise 45 seconds into the evening.
-    need = ["cell.bb.weight", "cell.bb.bias", "mlp.0.weight", "mlp.0.bias",
-            "mlp.2.weight", "mlp.2.bias"] + [f"cell.{k}.{w}" for k in ("ff1", "ff2", "ta", "tb")
-                                             for w in ("weight", "bias")]
+    # Every array the forward pass will index, checked HERE against enc_shapes. The recurrent
+    # loop only runs once a cycle has CLOSED, so anything only it touches -- the whole cell --
+    # otherwise passes every check, prints "online learning ON", drives the toy, and raises 45
+    # seconds into the evening.
     # cfc_features caches its stacked weights on this dict under "_cell4". Nothing underscore-
     # prefixed is part of the format, so drop any the file carries rather than let encoder.json
     # hand the forward pass a "cache" of its own choosing.
     for k in [k for k in e if k.startswith("_")]:
         del e[k]
-    lack = [k for k in need if k not in e["w"]]
-    if lack:
-        say(f"online learning OFF -- {ENCODER} is missing {lack[:3]}. Rebuild it with `train`.")
-        return None
-    if (e["w"]["cell.bb.weight"].shape[1] != 11 + NH_ENC
-            or e["w"]["mlp.2.weight"].shape[0] != NF_ENC
-            # Each head's ROW COUNT too, not just the ends of the net. cfc_features stacks these
-            # four into one matvec and slices the result by NH_ENC, so a pair of compensating
-            # corruptions that still sums to 4*NH_ENC used to return a wrong answer where the old
-            # four-matvec form raised. Cheap to check; the failure it prevents is silent.
-            # ...and their BIASES, which are the more dangerous half: cfc_features stacks those
-            # with a 1-D np.concatenate, and that never raises on mismatched lengths. A pair of
-            # compensating bias corruptions summing to 4*NH_ENC returned wrong features with no
-            # exception at all -- exactly what checking only the weights was supposed to prevent.
-            or any(e["w"][f"cell.{k}.weight"].shape[0] != NH_ENC
-                   or e["w"][f"cell.{k}.bias"].shape != (NH_ENC,) for k in KEYS4)):
-        say(f"online learning OFF -- {ENCODER} was built for a different feature size "
-            f"(expects 11+{NH_ENC} in, {NF_ENC} out). Rebuild it with `train`.")
+    bad = enc_bad(e["w"], e["dmin"], e["drange"])
+    if bad:
+        say(f"online learning OFF -- {ENCODER} does not match this build ({bad}). "
+            f"Rebuild it with `train`.")
         return None
     return e
 
 KEYS4 = ("ff1", "ff2", "ta", "tb")     # stacked into one matvec by cfc_features
+
+def enc_shapes(bb, mh):
+    """Every array cfc_features indexes and its exact shape, given the two widths the file is free
+    to pick (backbone `bb`, MLP hidden `mh`). A net may be WIDER; it may not be wired differently."""
+    return {"cell.bb.weight": (bb, HROW + NH_ENC), "cell.bb.bias": (bb,),
+            "mlp.0.weight": (mh, NH_ENC + len(POLICY_NAMES) + len(DESC_NAMES)),
+            "mlp.0.bias": (mh,), "mlp.2.weight": (NF_ENC, mh), "mlp.2.bias": (NF_ENC,),
+            **{f"cell.{k}.{q}": s for k in KEYS4
+               for q, s in (("weight", (NH_ENC, bb)), ("bias", (NH_ENC,)))}}
+
+def enc_bad(w, dmin, drange):
+    """The first thing wrong with a would-be encoder, or None. ONE table, checked on the way IN by
+    load_encoder and on the way OUT by cmd_train, rather than a condition grown at whichever end
+    got bitten last -- and that growth is not hypothetical. Of 20 single-dimension corruptions of
+    the shipped file, the hand-written form caught 3. Two more raised MID-SESSION, after printing
+    "online learning ON" and driving the toy, which is the exact failure it was written against.
+    Six were silent, because a length-1 array BROADCASTS: a 1-long mlp.2.bias moved the features
+    by 0.18, and one drange axis at 0 made every feature NaN with no exception anywhere."""
+    for k in ("cell.bb.weight", "mlp.0.weight"):
+        if k not in w or np.ndim(w[k]) != 2:
+            return f"{k} is missing or not a matrix"
+    for k, s in enc_shapes(w["cell.bb.weight"].shape[0], w["mlp.0.weight"].shape[0]).items():
+        if k not in w:
+            return f"missing {k}"
+        if w[k].shape != s:
+            return f"{k} is {w[k].shape}, expected {s}"
+    if dmin.shape != (len(DESC_NAMES),) or drange.shape != (len(DESC_NAMES),):
+        return f"dmin/drange are {dmin.shape}/{drange.shape}, expected ({len(DESC_NAMES)},)"
+    if not (np.all(np.isfinite(drange)) and drange.min() > 0):
+        return f"drange has a zero or non-finite axis: {drange.tolist()}"
+    return None
 
 
 def cfc_features(enc, hist, pol_n, desc_n):
@@ -912,12 +958,13 @@ def cfc_features(enc, hist, pol_n, desc_n):
     Wbb, bbb, n = w["cell.bb.weight"], w["cell.bb.bias"], NH_ENC
     h = np.zeros(n)
     if len(hist):
-        v = np.empty(11 + n)               # np.r_ rebuilt this every step, at 3x concatenate
+        v = np.empty(HROW + n)             # np.r_ rebuilt this every step, at 3x concatenate
         for row in hist:                   # one step per cycle already run this session
-            v[:11] = row; v[11:] = h
+            v[:HROW] = row; v[HROW:] = h
             u = W4 @ lecun(Wbb @ v + bbb) + b4
-            gate = 1.0 / (1.0 + np.exp(-(u[2 * n:3 * n] * (row[9] * 300.0) + u[3 * n:])))
-            h = np.tanh(u[:n]) * (1.0 - gate) + np.tanh(u[n:2 * n]) * gate   # cycle's REAL seconds
+            gate = 1.0 / (1.0 + np.exp(-(u[2 * n:3 * n] * row[HROW_T] + u[3 * n:])))
+            h = np.tanh(u[:n]) * (1.0 - gate) + np.tanh(u[n:2 * n]) * gate   # see Enc.phi for why
+            # HROW_T is fed as the fraction it already is, rather than rescaled to seconds
     X = np.concatenate([np.repeat(h[None], len(pol_n), 0), pol_n, desc_n], 1)
     a = X @ w["mlp.0.weight"].T + w["mlp.0.bias"]
     a = a / (1.0 + np.exp(-a))                                        # SiLU
@@ -983,7 +1030,18 @@ class Director:
         # Gated with everything else: _draw reads cells out of this log, so a trial written under
         # different knobs or different descriptor axes names a coordinate that no longer exists.
         # It used to be restored unconditionally, which seeded the anti-repeat with nonsense.
-        _ok = prior.get("names") == POLICY_NAMES and prior.get("desc") == DESC_NAMES
+        # ...and the ENCODER that produced the features those weights are expressed in. `train`
+        # rewrites model.json and encoder.json and leaves policy.json alone, so without this clause
+        # the next evening applied 32 RLS weights learned in the OLD encoder's basis to the NEW
+        # one -- silently, on the ordinary workflow. prior() has always written "predictor"; until
+        # now nothing read it, while the comment above claimed it was decisive.
+        # `reward` too. cmd_live tests four keys before calling reset_prior and this tested
+        # three, so a prior earned under a different CUM_COST was restored HERE and drew the first
+        # policy from those heads. Benign only because cmd_live re-checks a moment later: two
+        # hand-kept copies of one predicate, and the copy that loads the weights was the shorter.
+        _ok = (prior.get("names") == POLICY_NAMES and prior.get("desc") == DESC_NAMES
+               and prior.get("reward") == [CUM_COST, TIMEOUT_COST]
+               and (encoder is None or prior.get("predictor") == encoder.get("predictor")))
         self.trials = [t if isinstance(t, dict) else {"p": list(t[0]), "reward": float(t[1])}
                        for t in (prior.get("trials", []) if _ok else [])]
         # Cells only mean anything under the knob list AND the core that produced them: the last
@@ -1005,15 +1063,22 @@ class Director:
         # three left the third fresh at P0=1.0 beside two tight ones, and the proposal then
         # subtracted TIMEOUT_COST times a sample drawn from that noise; a file from a
         # different NF_ENC aborted the session with a raw matmul error and no reason.
+        # BOTH halves, at this width. Checking only `w` left the same defect one level down: a
+        # head whose covariance is missing is restored with a learned mean and a FRESH P0=1.0
+        # beside two tight ones -- measured, trace 32.0 against 28.7 -- which is verbatim the
+        # proposal noise this clause exists to prevent; a wrong-SHAPED P instead raises
+        # mid-session, on the first cycle that closes.
         _hd = prior.get("heads") or {}
         hd = _hd if (_ok and set(_hd) == {"press", "cum", "to"}
-                     and all(len(v.get("w", ())) == NF_ENC for v in _hd.values())) else {}
+                     and all(np.shape(v.get("w")) == (NF_ENC,)
+                             and np.shape(v.get("P")) == (NF_ENC, NF_ENC)
+                             for v in _hd.values())) else {}
         self.heads = {k: RLS(NF_ENC, **hd.get(k, {})) for k in ("press", "cum", "to")} \
             if encoder else None
         self.hist = [np.array(r, float) for r in (prior.get("cycle_hist") or [])][-HIST_ENC:] \
             if _ok else []
         self._extent()
-        self._sample()
+        self.start_cycle()
 
     def _extent(self):
         """What a cell MEANS: the observed range of each descriptor axis over the reachable space.
@@ -1036,7 +1101,7 @@ class Director:
         # a vibrator. The net is frozen, so feeding it units it never saw is feeding it noise:
         # measured 0.023 of feature range on vib, where features live in [-1,1]. One field was
         # doing two jobs that only coincide on linear.
-        H = np.array(self.hist[-HIST_ENC:], float) if self.hist else np.zeros((0, 11))
+        H = np.array(self.hist[-HIST_ENC:], float) if self.hist else np.zeros((0, HROW))
         b = descriptors(P, self.core, self.rate_ref) if desc is None else desc
         return cfc_features(self.enc, H, (P - POLICY_BOUNDS[:, 0]) / POLICY_SPAN,
                             (b - self.enc["dmin"]) / self.enc["drange"])
@@ -1114,19 +1179,29 @@ class Director:
         # cycle. _band is the only safe place to cache it -- _sample and encoder_dataset's one()
         # are the sole writers of self.p and both call _band immediately after, so a stale _pf is
         # only reachable down a path that would already be grading against the wrong band.
-        self._pf = tuple(map(float, self.p))
+        self._pf = pf = tuple(map(float, self.p))
+        # ...and both window ends. next_action cannot move them mid-cycle either: `lo` is
+        # fixed for the trial and `hi` takes one value per phase, so their round() ran
+        # once per COMMAND for a number that changes once per cycle. 0.95 us -> 0.49 us,
+        # and encoder_dataset calls this 5.4M times per train.
+        self._win = (round(pf[2], 3), round(min(1.0, pf[2] + pf[3]), 3),
+                     round(min(1.0, pf[2] + EASE_SPAN * pf[3]), 3))
         _lo_A, _hi_A, target, release = setpoints(self.p, self.core, self.rate_ref)[:4]
         self.target = float(np.clip(target + self.bias, 0.0, 1.0))
         self.release = min(float(np.clip(release + self.bias, 0.0, 1.0)), self.target)
 
-    def _sample(self):
-        self.p = self._draw()
+    def start_cycle(self, p=None):
+        """Everything a fresh cycle resets, in ONE place, `phase` included. `p` given runs that
+        policy instead of drawing one: encoder_dataset drives this same Director, and a reset it
+        only half-shares is how a train/serve skew starts -- its own copy left peakA and build_s
+        carrying over from the previous sample, into the two columns hist_row exists to pin."""
+        self.p = self._draw() if p is None else np.asarray(p, float)
         self._band()
         # build_s too: it is only assigned at the build->ease transition, so a cycle ending in
         # an orgasm before it ever eased kept the LAST cycle's number -- measured 45.0 s
         # recorded for a 5.0 s cycle, on the orgasm cycle specifically, straight into the
         # encoder's time gate.
-        self.phase_t = self.build_s = 0.0
+        self.phase, self.phase_t, self.build_s = "build", 0.0, 0.0
         self.peakA = 0.0      # highest PREDICTED arousal this cycle: the encoder's
                               # history column, and the quantity it was trained on
         self.peak = None      # None, not 0.0 -- "he never rated it" and "he rated it 0" are
@@ -1136,8 +1211,7 @@ class Director:
         """The context the cycle was running in no longer exists (different actuator, different
         hardware). Its evidence describes a machine that is not attached any more, so store NO trial
         and start a fresh cycle in `build`. Censored, never transferred."""
-        self.phase = "build"
-        self._sample()
+        self.start_cycle()
 
     def set_modality(self, tag):
         """The toy is only identified after the prior has been loaded, and a stroke window is not an
@@ -1152,7 +1226,7 @@ class Director:
         self.rate_ref = VIB_RATE_REF if tag == "vib" else None
         self._extent()   # a vibrator's descriptors are a different map: re-measure what a cell means
         if tag != self.mod:
-            self.mod, self.phase = tag, "build"
+            self.mod = tag
             self.reset_prior()
 
     def note_press(self, press):
@@ -1198,11 +1272,9 @@ class Director:
             # reached; feeding it a keypress at runtime is a different quantity on a different
             # scale in the same slot, and the encoder is dynamics-only by design -- what he felt
             # about it is the RLS heads' job, and they get it as their target.
-            self.hist.append(np.r_[(self.p - POLICY_BOUNDS[:, 0]) / POLICY_SPAN, self.peakA,
-                                   min(self.phase_t + self.build_s, 300.) / 300., float(cum)])
+            self.hist.append(hist_row(self.p, self.peakA, self.phase_t + self.build_s, cum))
             self.hist = self.hist[-HIST_ENC:]
-        self.phase = "build"
-        self._sample()
+        self.start_cycle()
 
     def observe(self, press, A):
         self.bias += BIAS_LR * ((press - A) - self.bias)
@@ -1236,14 +1308,15 @@ class Director:
         """The command the CURRENT policy asks for. Every knob is read from self.p HERE, at call
         time: read them once at the top of a call that can also resample and the first physical
         command of every new trial is the old trial's."""
-        _aim, _rel, lo, span, dur_hi, dur_lo, lfo_s, lfo_d = self._pf  # setpoints are self.target /
-        # self.release, frozen by _band at sample time and deliberately not re-read here
+        lo_r, hi_b, hi_e = self._win     # setpoints are self.target / self.release, frozen
+        # by _band at sample time and deliberately not re-read here
+        _aim, _rel, _lo, _span, dur_hi, dur_lo, lfo_s, lfo_d = self._pf
         w = 0.5 + 0.5 * math.sin(2 * math.pi * self.t / lfo_s)
         if self.phase == "build":
-            hi, dur = min(1.0, lo + span), dur_hi * (1.0 - lfo_d * w)
+            hi, dur = hi_b, dur_hi * (1.0 - lfo_d * w)
         else:
-            hi, dur = min(1.0, lo + 0.25 * span), dur_lo * (1.0 + lfo_d * w)
-        return round(float(lo), 3), round(float(hi), 3), round(max(float(dur), 0.10), 3)
+            hi, dur = hi_e, dur_lo * (1.0 + lfo_d * w)
+        return lo_r, hi, round(max(dur, 0.10), 3)
 
     def reset_prior(self):
         """Scores earned under different terms are not comparable, so the trial log is dropped --
@@ -1258,7 +1331,7 @@ class Director:
         self.trials = []
         self.hist = []
         self.heads = {k: RLS(NF_ENC) for k in ("press", "cum", "to")} if self.enc else None
-        self._sample()
+        self.start_cycle()
 
     def prior(self, predictor, modality):
         return {"predictor": predictor, "modality": modality,
@@ -1272,19 +1345,40 @@ class Director:
                 "heads": {k: v.dump() for k, v in self.heads.items()} if self.heads else {},
                 "cycle_hist": [r.tolist() for r in self.hist[-HIST_ENC:]]}
 
-def encoder_dataset(params, haz, rng, n=3000, hs=HIST_ENC):
+CYCLE_REF_S = 300.0   # the scale a cycle's LENGTH is fed to the encoder in -- and the scale
+                      # its own label is regressed on. cfc_features passes column 9 straight into
+                      # the CfC time gate, so an input and a label disagreeing about this number
+                      # is precisely the silent 300x error Enc.phi's comment describes.
+
+
+def hist_row(p, peak_A, cycle_s, cum):
+    """The 11 columns the frozen encoder reads for one finished cycle, in ONE place.
+
+    encoder_dataset writes these rows at train time and close_cycle writes them at run time, and
+    they used to be typed out separately. NOTHING in this program can catch them disagreeing:
+    load_encoder checks the row is 11 wide, and encoder.json is gated on the PREDICTOR hash --
+    neither sees a column rescaled or reordered on one side only. Demonstrated: swapping columns
+    9 and 10 in close_cycle alone, so the time gate reads the cum flag and the cum column reads a
+    duration, passes the entire 45-test harness including streaming parity and the live paths."""
+    return np.r_[(np.asarray(p, float) - POLICY_BOUNDS[:, 0]) / POLICY_SPAN,
+                 float(peak_A), min(float(cycle_s), CYCLE_REF_S) / CYCLE_REF_S, float(cum)]
+
+
+def encoder_dataset(params, haz, rng, n=3000, hs=HIST_ENC, m=6):
     """What the encoder learns from: run cycles on the NOMINAL plant and record, for each policy,
     the history that preceded it and what it went on to reach. Dynamics only -- no keypress, no
     reward, no preference. The frozen half must know how this body MOVES and nothing about taste,
     because taste is the online head's job and it learns that from him."""
     p = dict(zip(CORE_NAMES, params))
-    hist = np.zeros((n, hs, 11), np.float32)
-    pol = rng.uniform(POLICY_BOUNDS[:, 0], POLICY_BOUNDS[:, 1], (n, len(POLICY_NAMES)))
+    h0, sharp = haz
+    hist = np.zeros((n, hs, HROW), np.float32)
+    pol = np.zeros((n, len(POLICY_NAMES)))
     y = np.zeros((n, 2), np.float32)
 
+    LIM = MAX_BUILD_S + MAX_EASE_S + 30.0
+
     def one(d, q, st):
-        d.p = np.asarray(q, float); d._band()
-        d.phase, d.phase_t, d.peak, d.timed_out = "build", 0.0, None, False
+        d.start_cycle(q)
         lo, hi, dur = d.next_action()
         t, c0, pk = 0.0, d.cycles, 0.0
         cum = False
@@ -1293,13 +1387,13 @@ def encoder_dataset(params, haz, rng, n=3000, hs=HIST_ENC):
         # deadlines closing a cycle at all -- unreachable today (a cycle is bounded at ~485 s) and
         # loud rather than silent if that ever stops being true, because a sample truncated
         # quietly is a training row that says a policy timed out when it did not.
-        while d.cycles == c0 and t < MAX_BUILD_S + MAX_EASE_S + 30.0:
+        while t < LIM:                    # the cycles test below is what actually ends it
             A = st.step(hi - lo, dur); t += dur; pk = max(pk, A)
             # Orgasms drawn from the fitted hazard, not assumed away. This column was a hardcoded
             # 0.0 for every one of the 18000 history rows, so its weights never left their
             # initialisation -- and live sets it on precisely the cycle the heads most need read
             # correctly.
-            cum = rng.random() < cum_hazard(A, dur, *haz)
+            cum = rng.random() < cum_hazard(A, dur, h0, sharp)
             if cum:
                 st.refract()
             d.commit_observation(A, dur, cum)
@@ -1317,16 +1411,25 @@ def encoder_dataset(params, haz, rng, n=3000, hs=HIST_ENC):
     # memoised that per (core, modality) -- 40 ms on the first call, 0.2 ms after -- so the reuse
     # here is worth 0.6 s rather than the four minutes it was worth when it was written. Kept
     # because its state is reset per sample by `one()` anyway, so one Director is also simpler.
+    # A history cycle IS a labelled cycle -- policy, peak, length, which is exactly what a
+    # sample is -- so one chain of hs+m cycles yields m samples instead of 1. Every sample still
+    # carries hs real cycles of history and is still scored on a cycle no sample used as a target
+    # before it. Measured over 3 dataset seeds: 21000 cycles -> 6000 for the same 3000 samples,
+    # 69.7 s -> 18.5 s, and held-out MSE 0.00138 +/- 0.00003 against 0.00139 +/- 0.00003 -- on the
+    # old sample distribution AND on a long-session one. m=24 is 5.5x and costs +2%.
     d = Director(rng, p)
-    for b in range(n):
-        st = CoreStreamer(p)
-        for k in range(hs):
+    b = 0
+    while b < n:
+        st = CoreStreamer(p)     # one body per chain, and no state crosses a chain boundary
+        ring = []
+        for j in range(hs + m):
             q = rng.uniform(POLICY_BOUNDS[:, 0], POLICY_BOUNDS[:, 1])
             pk, t, cq = one(d, q, st)
-            hist[b, k] = np.r_[(q - POLICY_BOUNDS[:, 0]) / POLICY_SPAN,
-                               pk, min(t, 300.) / 300., cq]
-        pk, t, _ = one(d, pol[b], st)
-        y[b] = [pk, min(t, 300.) / 300.]
+            if j >= hs and b < n:
+                hist[b] = ring[-hs:]; pol[b] = q
+                y[b] = [pk, min(t, CYCLE_REF_S) / CYCLE_REF_S]   # column 9's scale, deliberately
+                b += 1
+            ring.append(hist_row(q, pk, t, cq))
     return hist, pol, y
 
 
@@ -1343,9 +1446,15 @@ def train_encoder(params, haz, rng, iters=1500):
     # The core fit is byte-reproducible and this was not: same seed, same data, 24 vs 8 threads
     # moved a weight by 3.8e-01 -- a completely different net -- because the intra-op split
     # changes the reduction order. Pinning makes encoder.json a function of the corpus alone,
-    # verified identical across separate processes. Free, and then some: 24 threads was the
-    # SLOWEST setting measured on this box (17.1 s against 12.4 s at 8).
-    torch.set_num_threads(8)
+    # verified identical across separate processes.
+    #
+    # ONE thread, not 8. Every tensor here is small -- batch 256 through widths 24..128, six
+    # timesteps -- so intra-op threading is pure fork/join, and it is the dominant cost: measured
+    # on this box, 1/2/4/6/8/12/16 threads run the loop in 16.5/26.9/26.8/28.4/30.2/28.5/32.7 s,
+    # monotone from 1 upward and 1.9x apart at the ends. The sweep that chose 8 only compared it
+    # with 24 -- both sides of a floor that is at 1. Same net either way: held-out MSE is
+    # 0.00163773 at every one of those settings, and each is byte-reproducible run to run.
+    torch.set_num_threads(1)
 
     class Cell(nn.Module):
         def __init__(s, din, h, bb=128):
@@ -1356,22 +1465,42 @@ def train_encoder(params, haz, rng, iters=1500):
             s.ta, s.tb = nn.Linear(bb, h), nn.Linear(bb, h)
 
         def forward(s, x, hid, ts):
-            z = 1.7159 * torch.tanh(0.666 * s.bb(torch.cat([x, hid], -1)))   # LeCun tanh
+            z = LECUN_A * torch.tanh(LECUN_B * s.bb(torch.cat([x, hid], -1)))  # see lecun()
             g = torch.sigmoid(s.ta(z) * ts + s.tb(z))
             return torch.tanh(s.ff1(z)) * (1.0 - g) + torch.tanh(s.ff2(z)) * g
 
     class Enc(nn.Module):
         def __init__(s):
             super().__init__()
-            s.cell = Cell(11, NH_ENC)
-            s.mlp = nn.Sequential(nn.Linear(NH_ENC + 8 + 6, 64), nn.SiLU(),
+            s.cell = Cell(HROW, NH_ENC)
+            s.mlp = nn.Sequential(nn.Linear(NH_ENC + len(POLICY_NAMES) + len(DESC_NAMES), 64), nn.SiLU(),
                                   nn.Linear(64, NF_ENC), nn.Tanh())
             s.head = nn.Linear(NF_ENC, 2)
 
         def phi(s, hist, pol, desc, keep=None):
             h = torch.zeros(pol.shape[0], NH_ENC)
             for t in range(hist.shape[1]):
-                nh = s.cell(hist[:, t], h, hist[:, t, 9:10] * 300.0)  # the cycle's REAL seconds
+                # Fed as cycle_s/300, NOT rescaled to seconds. The CfC's whole mechanism is a
+                # GRADED blend, gate=sigmoid(ta*ts+tb), and sigmoid is graded only for |arg| < ~5.
+                # With ts in seconds the argument sat at a median |45| -- where the derivative is
+                # 1e-20 -- so the closed form degenerated into a hard switch: measured on the
+                # shipped encoder, 0.76% of unit-steps interpolated at all and 3 of 24 hidden units
+                # did any grading. Now 99.4% and 24 of 24. `ta` is a learned weight and absorbs the
+                # 300, so this is an exact reparameterisation of the same model class; it only
+                # moves the initialisation into the band the sigmoid can resolve.
+                #
+                # IT DOES NOT IMPROVE ACCURACY, and an earlier version of this comment claimed it
+                # did (-6.2% at T=6, 6/6 seeds). That was measured with the DATASET held fixed and
+                # only the torch init varied. Across 3 datasets x 3 inits the paired difference is
+                # +0.00000 +- 0.00002 with 5/9 runs better -- nothing -- because dataset-to-dataset
+                # spread (0.00159 to 0.00224) is an order of magnitude larger than the effect. Kept
+                # because a saturated gate makes the continuous-time mechanism decorative and
+                # `ta` unlearnable, not because it scores better on this corpus.
+                #
+                # THIS LINE AND cfc_features' GATE ARE ONE CHANGE. encoder.json is gated on the
+                # predictor hash, not on this code, so applying one without the other is a silent
+                # 300x error that nothing in the program can detect.
+                nh = s.cell(hist[:, t], h, hist[:, t, HROW_T:HROW_T + 1])
                 h = nh if keep is None else torch.where(keep[:, t:t + 1], nh, h)
             return s.mlp(torch.cat([h, pol, desc], -1))
 
@@ -1411,11 +1540,37 @@ def train_encoder(params, haz, rng, iters=1500):
     with torch.no_grad():
         jl = torch.tensor(rng.integers(0, T_HIST + 1, NV))
         jk = torch.arange(T_HIST)[None] >= (T_HIST - jl[:, None])
-        held = ((net(H[-NV:], Pt[-NV:], Dt[-NV:], jk) - Y[-NV:]) ** 2).mean()
-    print(f"encoder  held-out MSE={held.item():.5f}  "
+        e2 = (net(H[-NV:], Pt[-NV:], Dt[-NV:], jk) - Y[-NV:]) ** 2
+        held, per = e2.mean(), e2.mean(0)
+    # Split by target: one scalar hid that 93% of the residual is cycle LENGTH (R2 0.75) while
+    # peak arousal is nearly solved (R2 0.97). Same 1:1 weighting either way -- reweighting was
+    # measured and makes cycle worse -- but the number should say which half is hard.
+    print(f"encoder  held-out MSE={held.item():.5f} (peak {per[0].item():.5f}, "
+          f"cycle {per[1].item():.5f})  "
           f"{sum(q.numel() for q in net.parameters())} params")
-    return ({k: v.detach().numpy().round(6).tolist() for k, v in net.state_dict().items()},
-            d0.dmin.tolist(), d0.drange.tolist())
+    # THE GATE. cfc_features is a second written copy of the net above, and until this existed
+    # nothing in the program compared them -- an edit landing on one side only is silent, and the
+    # held-out number printed just above cannot see it (four mutations of the cell, including
+    # feeding the time gate seconds instead of the /300 fraction, all scored inside seed noise).
+    # Checked on the ROUNDED weights and through the real numpy path, because that is what ships.
+    ew = {k: v.detach().numpy().round(6).tolist() for k, v in net.state_dict().items()}
+    probe = {"w": {k: np.array(v, float) for k, v in ew.items()}}
+    with torch.no_grad():
+        ref = net.phi(H[-8:], Pt[-8:], Dt[-8:]).numpy()
+    got = np.concatenate([cfc_features(probe, hist[-8 + i],
+                                       Pt[-8 + i][None].numpy().astype(float),
+                                       Dt[-8 + i][None].numpy().astype(float))
+                          for i in range(8)])
+    skew = float(np.max(np.abs(got - ref)))
+    print(f"encoder  numpy/torch parity={skew:.1e}")
+    if not skew < ENC_PARITY_TOL:
+        sys.exit(f"encoder NOT exported: cfc_features disagrees with the torch net by {skew:.3e} "
+                 f"(tolerance {ENC_PARITY_TOL:g}). They are two written copies of one model and an "
+                 f"edit landed on only one of them. `live` runs the numpy copy.")
+    return ew, d0.dmin.tolist(), d0.drange.tolist()
+
+ENC_PARITY_TOL = 1e-4   # 100x the round(6)+float32 export gap measured at 1.4e-06
+
 
 def cum_hazard(A, dt, h0, sharp):
     """Terminates rollouts, so a policy cannot ride a deterministic ceiling forever."""
@@ -1425,8 +1580,14 @@ def invariants(sessions, params):
     """Deterministic properties of the model about to be exported, each with an answer that is
     right or wrong independently of any policy, any simulated body and any taste: the streamer and
     the batch scan are one recurrence and must agree to the bit, zero stimulation must decay, and
-    the four outcome classes must rank in the one order the whole reward is built on. This is the
-    ONLY check entitled to block an export, and everything it looks at it can actually decide."""
+    the four outcome classes must rank in the one order the whole reward is built on. Everything it
+    looks at, it can actually decide -- which is what entitles it to block an export.
+
+    It is not the only such gate any more. train_encoder holds the second one, because the check it
+    performs (numpy cfc_features against the torch net) needs the trained net in memory and by the
+    time this runs the net is gone. Two gates, one rule: BOTH guard a duplication this program is
+    forced into -- the ODE written twice for two memory layouts, the encoder written twice because
+    `live` must not import torch -- and neither duplication has any other way to be caught."""
     p = dict(zip(CORE_NAMES, params))
     # Both a random draw AND the params actually being exported. A random vector exercises corners
     # the fit never reaches; the deployed one is the only vector that ships. It used to be the
@@ -1452,9 +1613,38 @@ def invariants(sessions, params):
             A = st.step(0.10, 1.0)
         return A
     drift, stop = decay(0.0, 600.0), decay(0.75, 120.0)
+    # setpoints() is a THIRD written solution of this same physics and nothing measured it against
+    # anything. It is the number _band grades a cycle against, the axis descriptors() bins into
+    # cells and the scale the encoder's features are read off, so a wrong one is wrong everywhere
+    # at once and silently -- and its exactness is a property of the params being exported, which
+    # is this gate's own standard. The build/ease amplitudes are restated here rather than
+    # returned by setpoints: a gate that imports the expression it checks is not a gate, the same
+    # reason the vibrator arm above calls ode(). Deployed params only -- the random vector above
+    # visits corners on purpose and failing those would reject a probe, not a model.
+    Pq = np.random.default_rng(11).uniform(POLICY_BOUNDS[:, 0], POLICY_BOUNDS[:, 1], (6, 8))
+    hi_amp = np.minimum(1.0, Pq[:, 2] + Pq[:, 3])
+    lo_amp = np.minimum(1.0, Pq[:, 2] + EASE_SPAN * Pq[:, 3])
+    reach = 0.0
+    for rr in (None, VIB_RATE_REF):
+        loA, hiA, _, _, _, _, tb, db, te, de_ = setpoints(Pq, p, rr)
+        for i in range(len(Pq)):
+            # where the two settle together hiA is the BAND_MIN FLOOR, which is not a claim about
+            # where the recurrence goes, so it is not checked against one
+            arms = [(lo_amp[i] if rr is not None else te[i], de_[i], loA[i])]
+            if hiA[i] > loA[i] + BAND_MIN + 1e-12:
+                arms.append((hi_amp[i] if rr else tb[i], db[i], hiA[i]))
+            for stim, dt_, want in arms:
+                st = CoreStreamer(p, rate_ref=rr)
+                for _ in range(int(2000.0 / float(dt_))):   # 30+ time constants at every bound
+                    A = st.step(float(stim), float(dt_))
+                reach = max(reach, abs(A - float(want)))
     order, tos, cums, cleans = outcome_ordering()
-    ok = bool(worst == 0.0 and drift <= 0.40 and stop <= 0.40 and order)
-    print(f"\ninvariants  parity={worst:.1e}  rest_drift={drift:.3f}  decay_from_0.75={stop:.3f}")
+    # Quoted in the units the number is USED in, not in ulps: target and release are compared
+    # against arousal and he reports on a 1/9 grid, so a tenth of a keypress level is the smallest
+    # discrepancy that can move anything. The deployed fit measures 1.7e-14.
+    ok = bool(worst == 0.0 and reach < 0.01 and drift <= 0.40 and stop <= 0.40 and order)
+    print(f"\ninvariants  parity={worst:.1e}  setpoint_reach={reach:.1e}  "
+          f"rest_drift={drift:.3f}  decay_from_0.75={stop:.3f}")
     print(f"  outcome order  timeout<={max(tos):+.3f} < cum<={max(cums):+.3f} < "
           f"clean>={min(cleans):+.3f}  {'held' if order else 'BROKEN'}")
     print("  " + ("PASS -- the exported model obeys them exactly."
@@ -1497,7 +1687,13 @@ def policy_probe(params, haz, encoder=None):
             if q != lvl and r.random() < SIM_PRESS_P:
                 d.note_press(q / 9.0); npress += 1
             lvl = q
-            cum = r.random() < cum_hazard(d.corrected(A), dur, *haz)
+            # RAW A, matching encoder_dataset and matching what the hazard was fit on:
+            # fit_first_cum_hazard runs stream_session, which carries no bias. This read
+            # d.corrected(A) and agreed only by accident -- observe() is the only thing that moves
+            # bias and neither simulated path calls it, so corrected(A) == A here. The moment
+            # either path gained a press-driven bias the two simulators would draw orgasms from
+            # different quantities, and the encoder's training data is generated by the other one.
+            cum = r.random() < cum_hazard(A, dur, *haz)
             if cum:
                 n += 1; st.refract()
             d.commit_observation(A, dur, cum)
@@ -1716,11 +1912,20 @@ def cmd_train(args):
         # the one the Director actually steers by. errs comes back in submission order and
         # training_sessions drops sessions with no press, so every fold contributes both arrays.
         labs = np.concatenate([s["press_vals"] for s in sessions]) if len(pooled) else pooled
+        # Across seeds too. The headline above was moved off runs[0] because one seed reports
+        # optimizer noise as a measurement; this table two lines below it was left on runs[0], and
+        # it is the one that answers WHERE the model is wrong. Measured on this corpus, the mid
+        # band spans 0.141 to 0.242 with nothing changed but the CEM seed -- a wider relative
+        # spread than the pooled number the multi-seed change was made for. seed 0 alone says mid
+        # is worse than low; the other three all say the opposite.
+        pooled_seeds = [np.concatenate([e for _, e, _ in r]) for r in runs]
         bands = {}
         for a, b, nm in ((0, .4, "low 0.0-0.4"), (.4, .7, "mid 0.4-0.7"), (.7, 1.01, "TOP 0.7-1.0")):
             m = (labs >= a) & (labs < b)
-            bands[nm] = round(float(pooled[m].mean()), 3) if m.any() else None
-            print(f"  {nm}: n={int(m.sum()):3d}" + (f"  MAE={bands[nm]}" if m.any() else ""))
+            vs = [float(pv[m].mean()) for pv in pooled_seeds] if m.any() else []
+            bands[nm] = round(float(np.mean(vs)), 3) if vs else None
+            print(f"  {nm}: n={int(m.sum()):3d}"
+                  + (f"  MAE={bands[nm]} +/- {np.std(vs, ddof=1):.3f}" if vs else ""))
         # pooled_press_mae is the MEAN over seeds, matching the headline. It used to be runs[0] --
         # the single-seed number the multi-seed change exists to stop reporting -- sitting under
         # the most obviously-named key in the file, which is where anyone reads it from.
@@ -1751,6 +1956,13 @@ def cmd_train(args):
     # The encoder is pinned to the model file that was just written: refit the core and this hash
     # moves, `live` sees the mismatch and refuses to start rather than steering on stale features.
     ew, dmin, drange = train_encoder(params, (h0, sharp), np.random.default_rng(0))
+    # The same table on the way OUT. train_encoder's parity gate proves the two forward passes
+    # agree; this proves the FILE is the shape load_encoder will demand, so a format change cannot
+    # ship an encoder that `live` then refuses -- and it is one table, not a second opinion.
+    bad = enc_bad({k: np.asarray(v, float) for k, v in ew.items()},
+                  np.asarray(dmin, float), np.asarray(drange, float))
+    if bad:
+        sys.exit(f"encoder NOT exported: {bad}. {CONFIG} is already exported and is unaffected.")
     write_json(ENCODER, {"predictor": load_config(CONFIG)[1], "w": ew,
                          "dmin": dmin, "drange": drange})
     print(f"exported {ENCODER}")
@@ -2111,7 +2323,11 @@ def cmd_live(args):
         # the loader reads and a recording made tonight needs no conversion to be trained on.
         dest = os.path.join(*os.path.split(args.data)[:-1],
                             ("VIB_" if is_vib[0] else "") + os.path.basename(args.data))
-        sid = next_session_id(dest, "VIB_" if is_vib[0] else "LIVE_", claim_dir=CKPT)
+        # Claimed only by the mode that writes. --auto and --manual record nothing, and every
+        # run of them burned the next index and left a .claim in checkpoint/ for a recording that
+        # never existed -- so the "index, never a clock" the docstring promises counts attempts.
+        sid = next_session_id(dest, "VIB_" if is_vib[0] else "LIVE_",
+                              claim_dir=CKPT if mode == "label" else None)
         f = w = None
         if mode == "label":
             fresh = not os.path.exists(dest) or os.path.getsize(dest) == 0
@@ -2337,13 +2553,13 @@ def cmd_live(args):
                 # one most likely to stall -- a dead link is usually WHY he hit Ctrl-C, and
                 # buttplug-py waits on a server reply with no timeout of its own.
                 await asyncio.wait_for(dev.send_stop_device_cmd(), 3.0)
-            with suppress(Exception):
+            with suppress(Exception, KeyboardInterrupt):
                 if keyboard is not None:
                     keyboard.unhook_all()
-            with suppress(Exception):
+            with suppress(Exception, KeyboardInterrupt):
                 if f is not None:
                     f.close()
-            with suppress(Exception):
+            with suppress(Exception, KeyboardInterrupt):
                 log(f"STOP mode={mode} cycles={director.cycles} "
                     f"bias={director.bias:+.3f} labeled={en}")
             # `en`, not `maxlab`: a session he spent pressing 0 is a session of real, hard-won
@@ -2351,16 +2567,16 @@ def cmd_live(args):
             # with "he repeatedly reported zero" -- the one distinction the rest of this file is
             # built on. Only a recording with no keypress at all is worth nothing.
             if w is not None and en == 0 and keyboard is not None:
-                with suppress(Exception):
+                with suppress(Exception, KeyboardInterrupt):
                     drop_session(dest, sid)
                     print(f"\nNO KEYPRESS all session -- {sid} removed from "
                           f"{os.path.basename(dest)}. Unrated is missing, not zero, so there is "
                           f"nothing here to train on.")
             elif w is not None:
                 print(f"\nsaved {en} labels -> {os.path.abspath(dest)} as session {sid}")
-            with suppress(Exception):
+            with suppress(Exception, KeyboardInterrupt):
                 logf.close()
-            with suppress(Exception):
+            with suppress(Exception, KeyboardInterrupt):
                 await asyncio.wait_for(client.disconnect(), 5.0)
     asyncio.run(main_loop())
 
