@@ -44,15 +44,6 @@
   button.primary:hover { background: var(--accent); }
   .filebtn input { display: none; }
 
-  .statusgrid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .5rem;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .6rem .8rem;
-    font-size: .82rem;
-  }
-  .statusgrid .k { color: var(--text-dim); }
-  .statusgrid .v { font-weight: 600; }
-  .ok { color: var(--good); } .no { color: var(--bad); }
-
   .progressline { font-size: .82rem; color: var(--accent); min-height: 1.2em; }
 
   #log {
@@ -63,26 +54,41 @@
   .pass, .ok-line { color: var(--good); } .fail, .err-line { color: var(--bad); }
   details { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .5rem .8rem; }
   summary { cursor: pointer; color: var(--text-dim); font-size: .82rem; }
+
+  .titlerow { display: flex; align-items: center; gap: .8rem 1rem; flex-wrap: wrap; justify-content: space-between; }
+  .chiprow { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; align-items: center; gap: .3rem;
+    background: #ece7f1; color: #201a29; border: 1px solid #b7adc6;
+    border-radius: 5px; padding: .3rem .5rem .3rem .65rem; font-size: .8rem; font-weight: 600;
+  }
+  .chip.empty { background: transparent; color: var(--text-dim); border: 1px dashed var(--line); font-weight: 400; }
+  .chip.empty.clickable { cursor: pointer; }
+  .chip.empty.clickable:hover { border-color: var(--accent); color: var(--text); }
+  .chip .x { background: none; border: none; color: #6b6377; cursor: pointer; font: inherit; font-size: 1rem; line-height: 1; padding: 0 0 0 .05rem; }
+  .chip .x:hover { color: #201a29; }
+  .chip.empty .x { display: none; }
 </style>
 </head>
 <body>
 <header>
-  <h1>cumpredict <span class="ver">v0.5</span></h1>
+  <div class="titlerow">
+    <h1>cumpredict <span class="ver">v0.5</span></h1>
+    <div class="chiprow" id="chiprow">
+      <span class="chip empty clickable" id="chip-sessions"><span class="label">sessions.csv</span><button class="x" title="clear">&times;</button></span>
+      <span class="chip empty" id="chip-model"><span class="label">model.json</span><button class="x" title="clear">&times;</button></span>
+      <span class="chip empty" id="chip-encoder"><span class="label">encoder.json</span><button class="x" title="clear">&times;</button></span>
+    </div>
+  </div>
   <p>Predictor + CfC encoder + RLS/Thompson policy + training, all client-side, verified against
   the real cumpredict.py (370/370 checks; see the self-test comment at the end of this file's
-  source). No Python anywhere in this repo. Live-session UI (device I/O, keyboard) is what's left.</p>
+  source). Bundled data loads automatically -- clear a chip above and upload your own to train on
+  different data. No Python anywhere in this repo.</p>
 </header>
 
 <div class="bar">
-  <button id="loadDefaults" class="primary">use bundled data (model + encoder + sessions.csv)</button>
   <label class="filebtn">upload your own CSV<input type="file" id="csvfiles" accept=".csv" multiple></label>
   <button id="selfcheck">run self-check</button>
-</div>
-
-<div class="statusgrid" id="datastatus">
-  <div><span class="k">model</span> <span class="v no" id="st-model">not loaded</span></div>
-  <div><span class="k">encoder</span> <span class="v no" id="st-encoder">not loaded</span></div>
-  <div><span class="k">sessions</span> <span class="v no" id="st-sessions">not loaded</span></div>
 </div>
 
 <div class="bar">
@@ -1452,16 +1458,24 @@ async function sha1Hex10(text) {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 10);
 }
 
-let sessions = [];      // populated by either "use bundled data" or the file input, same shape either way
+let sessions = [];      // populated by either the auto-load or the file input, same shape either way
 let trainResult = null;
 let bundledModel = null, bundledEncoder = null; // from ./model.json + ./encoder.json, if fetch worked
 
-function setStatus(id, ok, text) {
-  const el = document.getElementById(id);
-  el.textContent = text; el.className = "v " + (ok ? "ok" : "no");
+// Chips (top of page): filled = loaded, showing what's actually there; empty/dashed = not loaded.
+// filename=null clears it back to the dashed empty state showing defaultLabel.
+function setChip(key, filename, defaultLabel) {
+  const chip = document.getElementById("chip-" + key);
+  chip.querySelector(".label").textContent = filename || defaultLabel;
+  chip.classList.toggle("empty", !filename);
 }
 function refreshTrainBtn() {
   document.getElementById("trainbtn").disabled = sessions.length === 0;
+}
+
+async function loadSessionsFile(file) {
+  const text = await file.text();
+  return window.CumPredict.loadSessionsFromCsvText(text, file.name.replace(/\.csv$/i, ""), logLine);
 }
 
 // Relative paths -- resolve against wherever THIS page is actually being loaded from, same rule
@@ -1469,19 +1483,18 @@ function refreshTrainBtn() {
 // on GitHub Pages, the exact same fetch("./model.json") call resolves to that repo's own file at
 // that point, with no code change needed. Never touches GitHub directly -- it can't, the repo is
 // private right now -- it only ever reads whatever server actually served this HTML.
-async function loadDefaults(auto) {
-  clearLog(`${auto ? "auto-loading" : "loading"} bundled model.json + encoder.json + sessions.csv (same directory as this page)...`);
+async function loadDefaults() {
+  clearLog("auto-loading bundled model.json + encoder.json + sessions.csv (same directory as this page)...");
   try {
     const [modelText, encoderText, csvText] = await Promise.all(
       ["./model.json", "./encoder.json", "./sessions.csv"].map((p) =>
         fetch(p).then((r) => { if (!r.ok) throw new Error(`${p}: HTTP ${r.status}`); return r.text(); }))
     );
     bundledModel = modelText; bundledEncoder = encoderText;
-    setStatus("st-model", true, "loaded");
-    setStatus("st-encoder", true, "loaded");
-    const C = window.CumPredict;
-    sessions = C.loadSessionsFromCsvText(csvText, "sessions", logLine);
-    setStatus("st-sessions", true, `${sessions.length} sessions`);
+    setChip("model", "model.json", "model.json");
+    setChip("encoder", "encoder.json", "encoder.json");
+    sessions = window.CumPredict.loadSessionsFromCsvText(csvText, "sessions", logLine);
+    setChip("sessions", `sessions.csv (${sessions.length})`, "sessions.csv");
     refreshTrainBtn();
     logLine(`ready: ${sessions.map((s) => s.name).join(", ")}`);
   } catch (err) {
@@ -1496,22 +1509,31 @@ async function loadDefaults(auto) {
             `instead, or just use "upload your own CSV" above, which doesn't need fetch() at all.)`);
   }
 }
-document.getElementById("loadDefaults").addEventListener("click", () => loadDefaults(false));
-loadDefaults(true);
+loadDefaults();
 
 document.getElementById("csvfiles").addEventListener("change", async (e) => {
   const files = Array.from(e.target.files);
   if (!files.length) return;
   clearLog(`reading ${files.length} file(s)...`);
-  const C = window.CumPredict;
   sessions = [];
-  for (const f of files) {
-    const text = await f.text();
-    sessions = sessions.concat(C.loadSessionsFromCsvText(text, f.name.replace(/\.csv$/i, ""), logLine));
-  }
-  setStatus("st-sessions", sessions.length > 0, sessions.length ? `${sessions.length} sessions` : "no sessions found");
+  for (const f of files) sessions = sessions.concat(await loadSessionsFile(f));
+  setChip("sessions", sessions.length ? `${files.map((f) => f.name).join(", ")} (${sessions.length})` : null, "sessions.csv");
   refreshTrainBtn();
   logLine(`loaded: ${sessions.map((s) => s.name).join(", ")}`);
+});
+
+document.getElementById("chip-sessions").querySelector(".x").addEventListener("click", () => {
+  sessions = []; setChip("sessions", null, "sessions.csv"); refreshTrainBtn();
+  logLine("sessions.csv cleared -- upload your own to train.");
+});
+document.getElementById("chip-model").querySelector(".x").addEventListener("click", () => {
+  bundledModel = null; setChip("model", null, "model.json");
+});
+document.getElementById("chip-encoder").querySelector(".x").addEventListener("click", () => {
+  bundledEncoder = null; setChip("encoder", null, "encoder.json");
+});
+document.getElementById("chip-sessions").querySelector(".label").addEventListener("click", () => {
+  if (document.getElementById("chip-sessions").classList.contains("empty")) document.getElementById("csvfiles").click();
 });
 
 document.getElementById("trainbtn").addEventListener("click", async () => {
