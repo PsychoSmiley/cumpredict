@@ -31,7 +31,7 @@ latency and by whatever the actuator was doing at a cycle boundary.
 Deps: live  numpy + buttplug-py==0.3.0 keyboard
       train numpy pandas torch [scipy]     -- `live` imports none of the train-only ones
 """
-import argparse, glob, hashlib, json, math, os, sys, time
+import argparse, ctypes, glob, hashlib, json, math, os, sys, time
 from contextlib import suppress
 import numpy as np
 # pandas is imported INSIDE the two loaders that need it. It costs 292 ms and is
@@ -1052,7 +1052,7 @@ class Director:
         # a no-op, and the band sampled below would otherwise be quoted for a stroker's 1/dt.
         self.rate_ref = VIB_RATE_REF if self.mod == "vib" else None
         self.bias = 0.0
-        self.t = self.phase_t = self.build_s = 0.0
+        self.t = self.phase_t = 0.0
         self.cycles, self.timeouts, self.phase = 0, 0, "build"
         self.enc = encoder
         # The heads persist across evenings: what he likes is policy knowledge, not body state, so
@@ -1193,15 +1193,16 @@ class Director:
     def start_cycle(self, p=None):
         """Everything a fresh cycle resets, in ONE place, `phase` included. `p` given runs that
         policy instead of drawing one: encoder_dataset drives this same Director, and a reset it
-        only half-shares is how a train/serve skew starts -- its own copy left peakA and build_s
-        carrying over from the previous sample, into the two columns hist_row exists to pin."""
+        only half-shares is how a train/serve skew starts -- its own copy left peakA and phase_t
+        carrying over from the previous sample, into the columns hist_row exists to pin."""
         self.p = self._draw() if p is None else np.asarray(p, float)
         self._band()
-        # build_s too: it is only assigned at the build->ease transition, so a cycle ending in
-        # an orgasm before it ever eased kept the LAST cycle's number -- measured 45.0 s
-        # recorded for a 5.0 s cycle, on the orgasm cycle specifically, straight into the
-        # encoder's time gate.
-        self.phase, self.phase_t, self.build_s = "build", 0.0, 0.0
+        # No more BUILD/EASE alternation: every draw is independent and free to ask for anything,
+        # high or low, regardless of what the last one was. He asked for this directly -- a fixed
+        # up-down rule imposed on the learned policy was never something he wanted, and a
+        # predictable rhythm defeats the whole point. `self.phase` stays as a constant label only
+        # so logging and the status line keep working; it no longer switches.
+        self.phase, self.phase_t = "build", 0.0
         self.peakA = 0.0      # highest PREDICTED arousal this cycle: the encoder's
                               # history column, and the quantity it was trained on
         self.peak = None      # None, not 0.0 -- "he never rated it" and "he rated it 0" are
@@ -1265,14 +1266,13 @@ class Director:
                                 "peak": self.peak, "cum": bool(cum), "timeout": self.timed_out,
                                 "bias": round(self.bias, 4), "target": round(self.target, 4),
                                 "release": round(self.release, 4), "mod": self.mod,
-                                "build_s": round(self.build_s, 2),
-                                "ease_s": round(self.phase_t, 2)})
+                                "cycle_s": round(self.phase_t, 2)})
         if self.heads is not None:     # what the encoder reads next cycle: what this one DID
             # peakA, NOT his press. encoder_dataset trains this column on the arousal a cycle
             # reached; feeding it a keypress at runtime is a different quantity on a different
             # scale in the same slot, and the encoder is dynamics-only by design -- what he felt
             # about it is the RLS heads' job, and they get it as their target.
-            self.hist.append(hist_row(self.p, self.peakA, self.phase_t + self.build_s, cum))
+            self.hist.append(hist_row(self.p, self.peakA, self.phase_t, cum))
             self.hist = self.hist[-HIST_ENC:]
         self.start_cycle()
 
@@ -1297,25 +1297,29 @@ class Director:
         self.t += dt; self.phase_t += dt
         if cum:
             self.close_cycle(True)
-        elif self.phase == "build" and (Ah >= self.target or self.phase_t > MAX_BUILD_S):
+        # ONE trigger, not two: reaching this draw's own target, or timing out, ends the segment
+        # outright -- there is no ease-toward-release leg to run first. The next start_cycle() is
+        # a completely fresh, independent draw, free to ask for anything regardless of what this
+        # one asked for. `release` is still computed by _band (setpoints() gives it for free) and
+        # still recorded on the trial for whoever reads the log later, but nothing here waits for
+        # arousal to fall to it any more.
+        elif Ah >= self.target or self.phase_t > MAX_BUILD_S:
             self.timed_out |= self.phase_t > MAX_BUILD_S
-            self.phase, self.phase_t, self.build_s = "ease", 0.0, self.phase_t
-        elif self.phase == "ease" and (Ah <= self.release or self.phase_t > MAX_EASE_S):
-            self.timed_out |= self.phase_t > MAX_EASE_S
             self.close_cycle(False)
 
     def next_action(self):
         """The command the CURRENT policy asks for. Every knob is read from self.p HERE, at call
         time: read them once at the top of a call that can also resample and the first physical
         command of every new trial is the old trial's."""
-        lo_r, hi_b, hi_e = self._win     # setpoints are self.target / self.release, frozen
+        lo_r, hi_b, _hi_e = self._win    # setpoints are self.target / self.release, frozen
         # by _band at sample time and deliberately not re-read here
-        _aim, _rel, _lo, _span, dur_hi, dur_lo, lfo_s, lfo_d = self._pf
+        _aim, _rel, _lo, _span, dur_hi, _dur_lo, lfo_s, lfo_d = self._pf
         w = 0.5 + 0.5 * math.sin(2 * math.pi * self.t / lfo_s)
-        if self.phase == "build":
-            hi, dur = hi_b, dur_hi * (1.0 - lfo_d * w)
-        else:
-            hi, dur = hi_e, dur_lo * (1.0 + lfo_d * w)
+        # Always the build-style stroke: there is no ease leg to hand off to any more, every
+        # cycle drives at hi_b toward its own target until commit_observation closes it. _hi_e /
+        # _dur_lo stay unpacked above (both still feed descriptors()/the encoder grid through
+        # _band, unchanged) but next_action itself no longer reads either.
+        hi, dur = hi_b, dur_hi * (1.0 - lfo_d * w)
         return lo_r, hi, round(max(dur, 0.10), 3)
 
     def reset_prior(self):
@@ -2034,8 +2038,12 @@ def cmd_live(args):
         sys.exit("online learning cannot start (reason above).\n"
                  f"  fix: python cumpredict.py train --data {args.data}")
     director = Director(np.random.default_rng(), cfg["core_params"], prior, encoder=enc)
-    print(f"online learning ON -- CfC encoder {NF_ENC}d, 3 RLS heads, "
-          f"{len(director.hist)} cycles of carried history")
+    # No newline: nothing prints between here and setup()'s "connected & scanning" on the normal
+    # startup path (attach_device's own prints all fire later, from the scan callback), so this
+    # buffers on the same row and setup() finishes the line. flush=True because a line with no
+    # trailing newline can otherwise sit unshown until the next flush, and client.connect() below
+    # is a real await that could take a moment.
+    print(f"learning ON -- remembers your last {len(director.hist)} rounds; ", end="", flush=True)
     os.makedirs(CKPT, exist_ok=True)
     logf = open(CKPT + "/live.log", "a")
     t_log0 = time.perf_counter()
@@ -2062,15 +2070,32 @@ def cmd_live(args):
                                ("rotate", "RotateCmd")) if k in m]
 
     def key_of(d):
-        """Hardware identity, not just modality: two linear toys are not one experiment."""
-        return f"{getattr(d, 'name', '?')}[{','.join(caps_of(d))}]"
+        """Hardware identity -- the device's own NAME, nothing else. Used to used to be name plus
+        capability list ("two linear toys are not one experiment"), which sounded right and broke
+        on the very next reconnect: measured, the same Keon, reconnecting seconds after he powered
+        it off, read back caps=['vibrate'] with no LinearCmd anywhere in it -- a BLE service-
+        discovery race that had not finished by the time this ran, not a different toy. Baking that
+        read into "which device this is" turned one flaky query into a false DEVICE CHANGED. A
+        second physical toy sharing the Keon's product name is not a case this single-Keon file
+        needs to solve; a reconnect misreading its own capabilities is a case it hit tonight."""
+        return getattr(d, "name", "?")
 
     def attach_device(dev):
         """Runs on connect AND on every reconnect. Everything that is a property of the machine
         rather than of the session is decided here, and each of them is a context boundary."""
         nonlocal prior
-        m = getattr(dev, "allowed_messages", {})
-        is_vib[0] = "LinearCmd" not in m and ("VibrateCmd" in m or "RotateCmd" in m)
+        k = key_of(dev)
+        # Modality is read from capabilities only on the FIRST attach of a given device name.
+        # Re-deriving it on every reconnect meant the same flaky read that broke key_of also
+        # broke this: is_vib flipped to True on no evidence but a still-settling BLE handshake,
+        # tag became "vib", and reset_prior below discarded a full evening of linear heads and
+        # cycle history for a toy that had not actually changed -- moments before the session's
+        # own cum press landed, mistagged into the vib prior it created. A reconnect of the SAME
+        # name trusts the modality this session already established over a read that cannot be
+        # trusted yet; only a name that is genuinely new re-derives it.
+        if dev_key[0] is None or k != dev_key[0]:
+            m = getattr(dev, "allowed_messages", {})
+            is_vib[0] = "LinearCmd" not in m and ("VibrateCmd" in m or "RotateCmd" in m)
         streamer.rate_ref = VIB_RATE_REF if is_vib[0] else None
         log(f"MODALITY {'VIBRATION' if is_vib[0] else 'LINEAR'} caps={caps_of(dev)}")
         # Modality is only known now, after the policy prior was loaded. Rewards earned under a
@@ -2092,7 +2117,6 @@ def cmd_live(args):
         # only now can the right cell grid be measured; a no-op on a reconnect to the same
         # toy, so the trial already running survives it
         director.set_modality(tag)
-        k = key_of(dev)
         if dev_key[0] is not None and k != dev_key[0]:
             # Same policy, same heads, same trial, DIFFERENT hardware is not one experiment.
             log(f"DEVICE CHANGED {dev_key[0]} -> {k}: censoring the cycle in flight")
@@ -2100,8 +2124,9 @@ def cmd_live(args):
             director.censor_cycle()
         dev_key[0] = k
         last_pos[0] = None            # wherever the actuator physically is, we no longer know
-        print("modality: VIBRATION (auto) -- arousal readout UNCALIBRATED, trust your presses"
-              if is_vib[0] else "modality: LINEAR (auto)")
+        print(f" - device: {dev.name} [{', '.join(caps_of(dev)) or 'none'}] - "
+              + ("modality: VIBRATION (auto) -- UNCALIBRATED, trust your presses" if is_vib[0]
+                 else "modality: LINEAR (auto)"))
 
     def harden(client):
         """buttplug-py 0.3.0 answers a request by setting a result on the future the caller is
@@ -2141,8 +2166,6 @@ def cmd_live(args):
             raise RuntimeError(msg)
         if not devs:
             await bail(f"no device found -- is Intiface running at {args.intiface}?")
-        for i, d in devs.items():
-            print(f"  device {i}: {d.name} [{', '.join(caps_of(d)) or 'none'}]")
         # The toy we were already running is the first choice: a reconnect that silently lands on
         # a different actuator continues the session on hardware the trial in flight never touched.
         # Then linear, the modality the model was fit on. Then whatever is there.
@@ -2203,8 +2226,7 @@ def cmd_live(args):
             last_pos[0], up[0] = 0.0, False   # next command goes to lo, as it does from cold
             log("PARKED at 0.00")
 
-    # A scan code is a key POSITION, and two different keys share each of ten of them. Both
-    # collisions land inside 0-9, and both are live on this machine:
+    # A scan code is a key POSITION, and two different keys share each of ten of them.
     #   POSITION -- the navigation cluster IS the numpad. Page Up is scan 73, exactly like numpad
     #               9, and 9 means he came. Measured end to end: one Page Up logged *** CUM ***,
     #               wrote tired_level=1.00 into the corpus, applied REFRACTORY, and charged
@@ -2213,22 +2235,41 @@ def cmd_live(args):
     #               row types & e " ' ( - e _ c a, and keyed by POSITION the c scored 1.0 -- so
     #               typing "garcon" in ANY window recorded an orgasm. The hook is global, so which
     #               window has focus is irrelevant.
-    # So: the KEYPAD is read by position, which is what a keypad is for and is correct with
-    # NumLock either way; the number row is read by what the key actually TYPED.
     #
-    # That is NOT a guard against ordinary typing, and an earlier version of this comment claimed
-    # it was. Measured on this layout: Caps Lock is a SECOND SHIFT for the number row --
-    #     scan 10    none 'c'    shift '9'    caps '9'    shift+caps 'c'
-    # so with Caps Lock on, a bare 9 typed in any window rates him, and Shift+9 -- the habit this
-    # design encourages -- silently records nothing. There is no state on screen that says which
-    # way round it currently is. Hence the warning at startup below, and hence: THE KEYPAD IS THE
-    # RELIABLE INPUT. It is immune to layout, to Caps Lock and to NumLock.
-    # keyboard fills both fields in before the callback -- measured 46 ns, the same as before.
-    NAMED = {str(i): i / 9.0 for i in range(10)}    # what the key TYPED -- the number row
-    LEVEL_OF = {}                                   # where the key SITS -- the keypad
-    man = [0.0]      # manual: the level his last keypress asked for, 0..1
+    # Both got fixed once, by keying the number row on what it TYPED rather than where it sat.
+    # That fix was not enough, because the actual hazard was never the layout -- it was that the
+    # hook is global and ordinary typing produces literal digit characters constantly, with zero
+    # relationship to arousal. Measured: a real session ended on a false 9 while he was typing a
+    # UI-wording message to Claude that happened to contain an 8 and a 9 -- nowhere near the
+    # physical numpad, 20+ minutes into a session that had never rated above 0.44. Two presses,
+    # 0.89 then 1.00, nothing between them: not a ramp, a keystroke landing somewhere it shouldn't.
+    #
+    # NUMBER ROW REMOVED, keypad read by POSITION -- correct with NumLock either way, immune to
+    # layout and Caps Lock. Assumed, but never verified, that this was the whole fix: "nobody
+    # incidentally types on the numpad while doing something else." Falsified the same evening --
+    # he typed a deliberate 0-8 test into an unrelated, unfocused terminal and every one of those
+    # eight presses landed here too, walking `cycle`'s rated fraction of the way up its own
+    # 0..1 ladder in under five seconds (live.log +13m12.6s to +13m16.4s). The hook was never
+    # the bug; a hook with no notion of focus was always going to read a keystroke as a rating no
+    # matter which of his windows it was meant for. FOCUS-GATED below: a press is queued only
+    # while THIS process's own console is the window Windows is actually delivering keystrokes to
+    # on screen. Costs him having that window focused to rate at all -- worth it only because two
+    # different keystroke classes have now corrupted a real recording without it.
+    LEVEL_OF = {}                                   # where the key SITS -- the keypad, and now
+    man = [0.0]      # manual: the level his last keypress asked for, 0..1  # the only input read
     pressq = deque()
     down = set()
+
+    def _console_focused():
+        """True only while THIS process's own console is the window Windows is actually
+        delivering keystrokes to on screen. keyboard.hook has no notion of this -- it fires
+        identically whether the console is focused, minimized, or behind three other windows --
+        so this is the only thing standing between "he pressed 9" and "a 9 arrived somewhere,
+        sent by anything, meant for whatever had focus at the time." GetConsoleWindow is the
+        HWND this specific process is attached to, not any console; a python.exe launched by
+        cmd.exe /k shares the parent's console and gets that same HWND back."""
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        return hwnd != 0 and ctypes.windll.user32.GetForegroundWindow() == hwnd
 
     def on_key(e):
         """His keypress, captured in keyboard's own listener thread the instant it happens.
@@ -2242,20 +2283,18 @@ def cmd_live(args):
         Auto-repeat is not a new press: `down` edge-triggers, so holding 9 for a second is still
         exactly one orgasm. deque.append is atomic under the GIL, so no lock is needed between this
         thread and the loop."""
-        # The release is UNCONDITIONAL, before any name lookup. `keyboard` resolves a key's name
-        # under the modifier state at that instant, so Shift+9 arrives as '9' on the way down and
-        # -- if he lets go of Shift first -- as 'c' on the way up. Gating the discard on a
-        # recognised value stranded that scan code in `down` and killed the key for the rest of
-        # the session: measured 6 deliberate presses recorded as 1.
         if e.event_type == "up":
             down.discard(e.scan_code)
             return
-        v = LEVEL_OF.get(e.scan_code) if e.is_keypad else NAMED.get(e.name)
+        if not e.is_keypad:   # everything that is not the physical numpad -- see the block above
+            return
+        v = LEVEL_OF.get(e.scan_code)
         if v is None:
             return
         if e.scan_code not in down:
-            down.add(e.scan_code)
-            pressq.append(v)
+            down.add(e.scan_code)    # edge state tracked regardless of focus -- physical truth,
+            if _console_focused():   # not what gets acted on. Queuing IS what gets acted on.
+                pressq.append(v)
 
     if keyboard is not None:
         # NO SILENT FALLBACK, for the same reason the encoder has none. Both of these used to be
@@ -2278,15 +2317,9 @@ def cmd_live(args):
                      f"  Every press would be lost and the recording deleted as unrated at the\n"
                      f"  end of the session. Fix `keyboard`, or run --auto / --manual.")
 
-    if keyboard is not None and sys.platform == "win32":
-        with suppress(Exception):
-            import ctypes
-            if ctypes.windll.user32.GetKeyState(0x14) & 1:
-                print("\n  CAPS LOCK IS ON. On this keyboard layout that makes the bare number row\n"
-                      "  type digits, so anything you type in ANY window rates you -- and Shift+9\n"
-                      "  types a letter, so it records nothing. Turn it off, or use the KEYPAD,\n"
-                      "  which is immune to layout, Caps Lock and NumLock.\n")
-                log("CAPSLOCK ON at start -- number row inverted")
+    # No Caps Lock check needed any more: that warning existed only because the number row's
+    # reading depended on it. The keypad reads by position and was always immune -- removing the
+    # number row entirely removed the whole class this warning was about.
 
     def manual_action():
         """0 stops; 1-9 ramp depth and speed together, which is the one knob a keypad can carry.
@@ -2335,10 +2368,10 @@ def cmd_live(args):
             w = csv.writer(f)
             if fresh:
                 w.writerow(["session", "time_elapse", "intensity", "tired_level"])
-        print(f"\n--- {MODE_BANNER[mode]} ---")
-        print(f"  -> appending to {os.path.abspath(dest)} as session {sid}\n" if w
-              else "  -> nothing will be written\n")
-        A, t0, fails, maxlab, esum, en = 0.0, time.perf_counter(), 0, -1.0, 0.0, 0
+        print(f"\n--- {MODE_BANNER[mode]} ---"
+              + (f" appending session {sid} in .\\{os.path.basename(dest)}.\n" if w
+                 else " nothing will be written.\n"))
+        A, t0, fails, lastlab, en = 0.0, time.perf_counter(), 0, -1.0, 0
         outage, censored = 0.0, False   # dead seconds since the last command that actually went out
         vib_at_start = is_vib[0]        # dest and sid were chosen from this; see the guard below
         lo, hi, dur = manual_action() if mode == "manual" else director.next_action()
@@ -2393,11 +2426,16 @@ def cmd_live(args):
                     else:
                         # A dead radio is not the policy's fault, and charging it correctly needs
                         # both of these. Censor BEFORE committing: commit_observation can itself
-                        # CLOSE and score the cycle -- from `ease`, where A decaying over a dead
-                        # radio is exactly what crosses `release` -- so censoring afterwards
-                        # censors the cycle that REPLACED the one just booked, and the policy is
-                        # credited (measured +0.440, head moved 0.172) for a release the outage
-                        # produced. And censor on ACCUMULATED dead time: an outage arrives as many
+                        # CLOSE and score the cycle on nothing but the outage's own silent decay --
+                        # under the old build/ease split that fired via `ease`, where A decaying
+                        # over a dead radio was exactly what crossed `release` (measured historically:
+                        # +0.440, head moved 0.172, credited for a release the outage produced, not
+                        # anything the policy did). There is no more release-crossing trigger to do
+                        # that today, but `phase_t` still ages on outage time same as any other, so
+                        # the SAME race now closes a cycle via timeout instead -- see the -3.000
+                        # example a few lines down. Either way, censoring afterwards censors the
+                        # cycle that REPLACED the one just booked, once it's too late. And censor on
+                        # ACCUMULATED dead time: an outage arrives as many
                         # short failures, not one long one. Intiface killed costs ~4 s a command,
                         # never over OUTAGE_CENSOR_S, and 480 s of that still booked a -3.000
                         # TIMEOUT against a policy that never actuated anything -- into heads that
@@ -2459,8 +2497,12 @@ def cmd_live(args):
                     director.note_press(min(int(A * 9.0), 8) / 9.0)
                 else:
                     for label in presses:
-                        maxlab = max(maxlab, label)
-                        esum += abs(A - label); en += 1
+                        # LAST, not highest-ever: what he actually needs live is "did the press I
+                        # just made register", not a session peak he can't act on and that hides
+                        # whether the current one landed. Same "the row keeps the last" rule the
+                        # CSV write already uses two presses can arrive in one command window.
+                        lastlab = label
+                        en += 1
                         director.observe(label, A)  # corrects the belief about predictor bias, and
                         director.note_press(label)  # separately IS this cycle's entire score
                         log(f"YOU={label:.2f} PRED={A:.2f} bias={director.bias:+.2f} "
@@ -2500,11 +2542,38 @@ def cmd_live(args):
                     print(f"\r {bar:<22} {A:0.2f} | MANUAL level {man[0]:.2f} "
                           f"| depth {hi:.2f} @ {dur:.2f}s   ", end="", flush=True)
                 else:
-                    mae = f"MAE {esum / en:.2f}" if en else "MAE --"
-                    print(f"\r {bar:<22} {A:0.2f} | you "
-                          f"{maxlab if maxlab >= 0 else ('auto' if mode == 'auto' else '--')} "
-                          f"| {mae} | {director.phase.upper():5s} c{director.cycles} "
-                          f"win {lo:.2f}-{hi:.2f} bias{director.bias:+.2f}   ", end="", flush=True)
+                    # Short on purpose: \r overwrites in place only within ONE console row. A
+                    # line that wraps to a second row can't be rewound by \r -- each redraw only
+                    # overwrites the wrapped tail, and the earlier segment stacks up unbounded.
+                    # Measured: the previous, longer line wrapped at ~120 columns and produced
+                    # exactly that -- a growing smear of repeated text instead of one clean line.
+                    # "off 0.52" and "nudge +0.30" -- the running avg-miss and the live
+                    # bias -- used to sit here as two unlabeled numbers nobody could place. Both
+                    # were pieces of the SAME fact: how much the model's own guess is being
+                    # corrected by what he actually rates. director.corrected(A) is that fact
+                    # already computed as ONE number (it's the exact quantity the director
+                    # itself compares against `target` to decide when a cycle's done), so it
+                    # replaces the raw predictor output here instead of sitting beside it as a
+                    # third, confusable arousal-shaped number. The raw, uncorrected A is still
+                    # fully recoverable later from the PRED=/bias= pair already in live.log if
+                    # anyone ever wants the split back. Elapsed time earns the freed room --
+                    # asked for twice now.
+                    em, es = divmod(int(time.perf_counter() - t0), 60)
+                    elapsed = f"+{em}m" if es == 0 else f"+{em}m{es:02d}s"
+                    last_s = (f"{lastlab:.2f}" if lastlab >= 0
+                             else ("auto" if mode == "auto" else "--"))
+                    # cycle-count and press-count are two UNRELATED tallies -- one is how many
+                    # targets the director has picked and gone for, the other is how many times
+                    # he's pressed. Printed right next to each other as "cycle 7 (17 presses)" that
+                    # reads as one modifying the other (like a multiplier); separated by a pipe,
+                    # they read as what they are: two separate counters that happen to both go up
+                    # over a session. No phase word here any more -- every cycle picks its own
+                    # target free of any build/ease label, so `stroke {lo}-{hi}` IS the evidence
+                    # of what the director just decided, not a fixed word that never changes.
+                    print(f"\r {elapsed} guessed arousal {director.corrected(A):0.2f} "
+                          f"| your arousal {last_s} | cycle {director.cycles} | {en} presses "
+                          f"| stroke {lo:.2f}-{hi:.2f}   ",
+                          end="", flush=True)
                 # Row and console are written first: both describe the command that just ran, under
                 # the policy and the phase that ran it. Only then is the cycle allowed to end -- and
                 # if it does, next_action() is what asks the newly sampled policy what IT wants.
@@ -2513,7 +2582,12 @@ def cmd_live(args):
                     continue
                 director.commit_observation(A, wall, cum)
                 if cum and args.finish_on_cum:      # the trial is credited and closed above; the
-                    log("FINISH-ON-CUM -- stopping after the cum row was written")
+                    # Not unconditional: said "the cum row was written" even the one evening it
+                    # wasn't (w already None from the modality-close guard above), asserting a
+                    # write that never happened. w is exactly the fact of whether one did.
+                    log("FINISH-ON-CUM -- stopping" + (" after the cum row was written" if w
+                        is not None else " -- NOT written to the corpus, recording had already "
+                        "stopped this evening (see MODALITY CHANGED above)"))
                     break                           # cum row is the best label in the dataset
                 lo, hi, dur = director.next_action()
         except KeyboardInterrupt:
