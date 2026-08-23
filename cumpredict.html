@@ -1,0 +1,1621 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cumpredict</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #141019;
+    --panel: #1d1826;
+    --panel-2: #251f30;
+    --line: #372f45;
+    --text: #ede8f4;
+    --text-dim: #9990ac;
+    --accent: #e0994f;
+    --accent-dim: #7a5a35;
+    --good: #6fae8c;
+    --bad: #d9634f;
+    --mono: ui-monospace, Consolas, "SF Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text); font: 14px/1.45 var(--mono);
+    margin: 0; padding: .9rem; display: flex; flex-direction: column; gap: .6rem;
+    max-width: 980px; margin-inline: auto;
+  }
+  h1 { font-size: 1.15rem; margin: 0; letter-spacing: .01em; }
+  h1 .ver { color: var(--accent); font-weight: 400; }
+  .dim { color: var(--text-dim); }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+  header p { margin: 0; font-size: .82rem; color: var(--text-dim); max-width: 62ch; }
+
+  .bar { display: flex; gap: .5rem; flex-wrap: wrap; }
+  button, .filebtn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    padding: .7rem 1rem; font: inherit; font-size: .92rem; font-weight: 600; cursor: pointer;
+    border-radius: 6px; flex: 1 1 auto; text-align: center; white-space: nowrap;
+  }
+  button:hover, .filebtn:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #fff2e2; }
+  button.primary:hover { background: var(--accent); }
+  .filebtn input { display: none; }
+
+  .statusgrid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .5rem;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .6rem .8rem;
+    font-size: .82rem;
+  }
+  .statusgrid .k { color: var(--text-dim); }
+  .statusgrid .v { font-weight: 600; }
+  .ok { color: var(--good); } .no { color: var(--bad); }
+
+  .progressline { font-size: .82rem; color: var(--accent); min-height: 1.2em; }
+
+  #log {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: .7rem .8rem; white-space: pre-wrap; word-break: break-word; font-size: .8rem;
+    flex: 1 1 auto; min-height: 220px; max-height: 46vh; overflow-y: auto; margin: 0;
+  }
+  .pass, .ok-line { color: var(--good); } .fail, .err-line { color: var(--bad); }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .5rem .8rem; }
+  summary { cursor: pointer; color: var(--text-dim); font-size: .82rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cumpredict <span class="ver">v0.5</span></h1>
+  <p>Predictor + CfC encoder + RLS/Thompson policy + training, all client-side, verified against
+  the real cumpredict.py (370/370 checks; see the self-test comment at the end of this file's
+  source). No Python anywhere in this repo. Live-session UI (device I/O, keyboard) is what's left.</p>
+</header>
+
+<div class="bar">
+  <button id="loadDefaults" class="primary">use bundled data (model + encoder + sessions.csv)</button>
+  <label class="filebtn">upload your own CSV<input type="file" id="csvfiles" accept=".csv" multiple></label>
+  <button id="selfcheck">run self-check</button>
+</div>
+
+<div class="statusgrid" id="datastatus">
+  <div><span class="k">model</span> <span class="v no" id="st-model">not loaded</span></div>
+  <div><span class="k">encoder</span> <span class="v no" id="st-encoder">not loaded</span></div>
+  <div><span class="k">sessions</span> <span class="v no" id="st-sessions">not loaded</span></div>
+</div>
+
+<div class="bar">
+  <button id="trainbtn" class="primary" disabled>train (fit predictor + hazard, then encoder)</button>
+  <button id="exportbtn" style="display:none">download model.json + encoder.json</button>
+</div>
+<div id="trainprogress" class="progressline"></div>
+<pre id="log">ready. click "use bundled data" or upload your own CSV.</pre>
+
+<script>
+/* ============================== core.js, inlined verbatim ==============================
+ * DOM-free by design -- this exact file also runs unmodified under `node core.js` via the UMD
+ * wrapper below, which is how it gets tested during development (see the repo's parity.js).
+ * Ported line-for-line from cumpredict.py; see that file for the full rationale comments this
+ * copy deliberately does not repeat. */
+(function (root, factory) {
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.CumPredict = factory();
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  // ---------------------------------------------------------------- constants
+  const CORE_NAMES = ["a", "b", "tauE", "g", "thr", "rho", "lam", "kH", "hH", "dH"];
+  const CORE_BOUNDS = [
+    [1.00, 3.0], [0.20, 1.5], [10.0, 60.0], [0.20, 10.0], [0.00, 2.5],
+    [1e-4, 0.02], [0.015, 0.06], [0.00, 5.0], [0.00, 0.05], [1e-4, 0.02],
+  ];
+  const CEM_ITERS = 40, CEM_POP = 80, CEM_ELITE = 0.15, CEM_RESTARTS = 2, REST_PENALTY = 3.0;
+  const POLICY_NAMES = ["aim", "rel", "lo", "span", "dur_hi", "dur_lo", "lfo_s", "lfo_d"];
+  const POLICY_BOUNDS = [
+    [0.55, 0.97], [0.25, 0.85], [0.00, 0.45], [0.35, 1.00],
+    [0.13, 0.45], [0.45, 2.50], [1.50, 8.00], [0.00, 0.35],
+  ];
+  const POLICY_LO = POLICY_BOUNDS.map((b) => b[0]);
+  const POLICY_HI = POLICY_BOUNDS.map((b) => b[1]);
+  const POLICY_SPAN = POLICY_LO.map((lo, i) => POLICY_HI[i] - lo);
+  const DESC_NAMES = ["travel_build", "dur_build", "travel_ease", "dur_ease", "target", "cycle_s"];
+  const EASE_SPAN = 0.25;
+  const BAND_MIN = 0.05;
+  const REFRACTORY = 0.35;
+  const PEAK_MAX = 8 / 9.0;
+  const CUM_COST = 2.5;
+  const TIMEOUT_COST = 3.0;
+  const BIAS_LR = 0.25;
+  const CUM_THR = 0.99;
+  const MAX_BUILD_S = 300.0, MAX_EASE_S = 180.0;
+  const VIB_RATE_REF = 2.0;
+  const RLS_SIGMA = 0.25, RLS_P0 = 1.0, RLS_Q = 1e-4, NN_CAND = 48;
+  const NF_ENC = 32, NH_ENC = 24, HIST_ENC = 6, RECENT_CELLS = 8;
+  const HROW = POLICY_NAMES.length + 3; // 11
+  const HROW_T = 9;
+  const LECUN_A = 1.7159, LECUN_B = 0.666;
+  const CYCLE_REF_S = 300.0;
+  const NBIN = 4;
+  const EPS_UNIFORM = 0.25;
+  const EXTENT_N = 20000;
+  const KEYS4 = ["ff1", "ff2", "ta", "tb"];
+  const BETA = 4.0, PRESS_BOOST = 8.0; // label weighting: near-cum emphasis, real-press boost
+  const MERGE_GAP_S = 120.0;
+  const N_AUG = 2;
+
+  const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+
+  // ---------------------------------------------------------------- session data loading
+  // Sparse labels -> dense target: ramp UP between rising presses, step DOWN. lab: array of T
+  // numbers, NaN where he didn't press. tS: cumulative seconds.
+  function interpOnRise(lab, tS) {
+    const T = lab.length;
+    const pressIdx = [];
+    for (let i = 0; i < T; i++) if (!Number.isNaN(lab[i])) pressIdx.push(i);
+    const y = new Float64Array(T), isPress = new Array(T).fill(false);
+    if (!pressIdx.length) return { y, isPress, pressIdx: [], vals: [] };
+    for (const i of pressIdx) isPress[i] = true;
+    const vals = pressIdx.map((i) => lab[i]);
+    let pi = pressIdx, pv = vals;
+    if (pressIdx[0] !== 0) { pi = [0, ...pressIdx]; pv = [0.0, ...vals]; }
+    for (let j = 0; j < pi.length; j++) {
+      const a = pi[j], va = pv[j], hasNext = j + 1 < pi.length;
+      const b = hasNext ? pi[j + 1] : T - 1, vb = hasNext ? pv[j + 1] : va;
+      y[a] = va;
+      if (vb > va) {
+        const span = Math.max(tS[b] - tS[a], 1e-9);
+        for (let k = a; k <= b; k++) y[k] = va + ((vb - va) * (tS[k] - tS[a])) / span;
+      } else {
+        for (let k = a; k < b; k++) y[k] = va;
+        y[b] = vb;
+      }
+    }
+    for (let i = 0; i < T; i++) y[i] = clamp(y[i], 0, 1);
+    return { y, isPress, pressIdx, vals };
+  }
+
+  function sessionFromRaw(name, durSIn, intensityIn, tiredIn) {
+    const n = durSIn.length;
+    const durS = Array.from(durSIn, (v) => Math.max(v, 1e-3));
+    const intensity = Array.from(intensityIn, (v) => clamp(v, 0, 1));
+    const tired = Array.from(tiredIn);
+    const tS = new Float64Array(n);
+    let acc = 0;
+    for (let i = 0; i < n; i++) { acc += durS[i]; tS[i] = acc; }
+    const { y, isPress, pressIdx, vals } = interpOnRise(tired, tS);
+    const w = new Float64Array(n);
+    for (let i = 0; i < n; i++) w[i] = durS[i] * (1.0 + BETA * y[i]);
+    for (const i of pressIdx) w[i] *= PRESS_BOOST;
+    return { name, intensity, y, w, isPress, durS, tS: Array.from(tS), pressIdx, pressVals: vals,
+             rawDurS: durS.slice(), rawIntensity: intensity.slice(), rawTired: tired.slice() };
+  }
+
+  function parseCsvText(text) {
+    const lines = text.split(/\r\n|\n/).filter((l) => l.length > 0);
+    if (!lines.length) return { header: [], rows: [] };
+    const header = lines[0].split(",").map((h) => h.trim());
+    return { header, rows: lines.slice(1).map((line) => line.split(",")) };
+  }
+
+  function toNum(s) {
+    // Number("") is 0 in JS, not NaN -- a blank cell (his usual "no press this row") would
+    // silently become a real press of value 0, exactly the missing-vs-zero distinction this
+    // whole project treats as load-bearing. Must be checked before Number(), not caught by it.
+    if (s === undefined) return NaN;
+    const t = s.trim();
+    if (t === "") return NaN;
+    const v = Number(t);
+    return Number.isFinite(v) ? v : NaN;
+  }
+
+  // Header/rows already exclude any "session" column -- see loadSessionsFromCsvText.
+  function sessionFromFrame(name, header, rows, warn) {
+    warn = warn || console.warn;
+    const iT = header.indexOf("time_elapse"), iI = header.indexOf("intensity"), iL = header.indexOf("tired_level");
+    if (iT < 0 || iI < 0 || iL < 0) throw new Error(`${name}: missing time_elapse/intensity/tired_level column`);
+    const n0 = rows.length;
+    const parsed = rows.map((r) => ({ t: toNum(r[iT]), i: toNum(r[iI]), lab: toNum(r[iL]) }));
+    const kept = parsed.filter((r) => !Number.isNaN(r.t) && !Number.isNaN(r.i));
+    if (kept.length < n0)
+      warn(`  ${name}: dropped ${n0 - kept.length} unparseable row(s) -- a stray header or a torn line means this recording was concatenated out of more than one file.`);
+    const bad = kept.map((r) => r.lab).filter((v) => !Number.isNaN(v) && (v < 0 || v > 1));
+    if (bad.length)
+      throw new Error(`${name}: ${bad.length} tired_level values outside [0,1] -- the column is his keypress divided by 9, not the raw digit.`);
+    return sessionFromRaw(name, kept.map((r) => r.t * 60.0), kept.map((r) => r.i), kept.map((r) => r.lab));
+  }
+
+  // One CSV file's text -> array of sessions. If it has a "session" column, groups by it (sorted
+  // by session id, matching pandas groupby+sorted in the original) same as one directory of files
+  // there; otherwise the whole file is one session named `defaultName` (its filename, typically).
+  function loadSessionsFromCsvText(text, defaultName, warn) {
+    const { header, rows } = parseCsvText(text);
+    const iSession = header.indexOf("session");
+    if (iSession < 0) return [sessionFromFrame(defaultName, header, rows, warn)];
+    const groups = new Map();
+    for (const r of rows) {
+      const key = r[iSession];
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    const names = [...groups.keys()].sort();
+    const subHeader = header.filter((_, i) => i !== iSession);
+    return names.map((name) => sessionFromFrame(String(name), subHeader,
+      groups.get(name).map((r) => r.filter((_, i) => i !== iSession)), warn));
+  }
+
+  // First window of `w` consecutive rows that appears twice in one recording, as [i,j], or null.
+  // Not Python's exact rolling-hash scheme (that needs the modular inverse of the outgoing term,
+  // an easy place for a correctness CHECK to itself be subtly wrong) -- recomputes each window's
+  // hash directly, O(n*w) rather than O(n). At real session sizes (thousands of rows, not
+  // millions) that is still sub-second, and every candidate match is confirmed by comparing the
+  // actual rows before being reported, so a 32-bit hash collision costs nothing but a wasted
+  // comparison, never a wrong answer.
+  function replayedRows(sess, w) {
+    w = w || 128;
+    const n = sess.rawDurS.length;
+    if (n < 2 * w) return null;
+    const rowKey = (i) => `${sess.rawDurS[i]},${sess.rawIntensity[i]},${Number.isNaN(sess.rawTired[i]) ? -1 : sess.rawTired[i]}`;
+    const rowHash = new Array(n);
+    for (let i = 0; i < n; i++) {
+      let h = 5381;
+      const s = rowKey(i);
+      for (let c = 0; c < s.length; c++) h = (h * 33) ^ s.charCodeAt(c);
+      rowHash[i] = h >>> 0;
+    }
+    function windowEqual(a, b) {
+      for (let k = 0; k < w; k++) if (rowKey(a + k) !== rowKey(b + k)) return false;
+      return true;
+    }
+    function windowHash(start) {
+      let h = 0;
+      for (let k = 0; k < w; k++) h = (h * 1000003 + rowHash[start + k]) >>> 0;
+      return h;
+    }
+    const seen = new Map();
+    seen.set(windowHash(0), [0]);
+    for (let i = 1; i <= n - w; i++) {
+      const h = windowHash(i);
+      const bucket = seen.get(h);
+      if (bucket) {
+        for (const j of bucket) if (i - j >= w && windowEqual(j, i)) return [j, i];
+        bucket.push(i);
+      } else {
+        seen.set(h, [i]);
+      }
+    }
+    return null;
+  }
+
+  // load_sessions plus the two gates that only matter once rows become training evidence: no
+  // press-less sessions (interpolates to y=0 everywhere while carrying full duration weight --
+  // dense "evidence" that arousal was zero all session, which is exactly what "missing, not
+  // zero" forbids), and no mixing vibrator with linear recordings (different actuator, different
+  // exponents). Throws rather than exiting -- the caller (page UI) decides how to show it.
+  function trainingSessions(sessions, warn) {
+    warn = warn || console.warn;
+    const kinds = new Set(sessions.map((s) => (s.name.toUpperCase().startsWith("VIB") ? "vib" : "linear")));
+    if (kinds.size > 1)
+      throw new Error("sessions mix VIB_* and linear recordings -- a vibrator's intensity is a held amplitude, not a stroke travel. Train them from separate files.");
+    const keep = [];
+    for (const s of sessions) {
+      const dup = replayedRows(s);
+      if (dup)
+        throw new Error(`${s.name}: rows ${dup[0]} and ${dup[1]} begin identical blocks -- this recording contains a REPLAY, not two similar stretches. Repair the file before training.`);
+      if (s.pressIdx.length) keep.push(s);
+      else warn(`  skipping ${s.name}: no keypresses -- unrated is missing, not zero`);
+    }
+    return keep;
+  }
+
+  // Labels untouched; keeps the true session start and time-warps to decorrelate stroke rate
+  // from outcome. rng: anything with .random() in [0,1).
+  function augmentRaw(sess, rng) {
+    let dur = sess.rawDurS.slice(), inten = sess.rawIntensity.slice(), tired = sess.rawTired.slice();
+    if (rng.random() < 0.5) {
+      const lo = Math.max(Math.floor(0.6 * dur.length), sess.pressIdx[0] + 1);
+      const k = lo + Math.floor(rng.random() * (dur.length + 1 - lo));
+      dur = dur.slice(0, k); inten = inten.slice(0, k); tired = tired.slice(0, k);
+    }
+    inten = inten.map((v) => clamp(v + (rng.random() * 2 - 1) * 0.05, 0, 1));
+    dur = dur.map((v) => v * Math.exp((rng.random() * 2 - 1) * 0.1));
+    const scale = Math.exp(Math.log(0.7) + rng.random() * (Math.log(1.4) - Math.log(0.7)));
+    dur = dur.map((v) => v * scale);
+    return sessionFromRaw(sess.name + "_aug", dur, inten, tired);
+  }
+
+  function cumOnsets(tS, pressIdx, pressVals) {
+    const times = [];
+    for (let k = 0; k < pressIdx.length; k++) if (pressVals[k] >= CUM_THR) times.push(tS[pressIdx[k]]);
+    times.sort((a, b) => a - b);
+    const out = [];
+    for (const tm of times) if (!out.length || tm - out[out.length - 1] > MERGE_GAP_S) out.push(tm);
+    return out;
+  }
+
+  // ---------------------------------------------------------------- predictor core
+  function softplus(x) {
+    return x > 0.0 ? x + Math.log1p(Math.exp(-x)) : Math.log1p(Math.exp(x));
+  }
+
+  class CoreStreamer {
+    constructor(params, rateRef) {
+      for (const k of CORE_NAMES) this[k] = params[k];
+      this.rateRef = rateRef === undefined ? null : rateRef;
+      this.E = this.A = this.H = 0.0;
+    }
+
+    refract() {
+      this.A *= REFRACTORY;
+      this.E *= REFRACTORY;
+    }
+
+    step(intensity, dt) {
+      intensity = clamp(Number(intensity), 1e-4, 1.0);
+      dt = Math.max(Number(dt), 1e-3);
+      const rate = this.rateRef !== null ? this.rateRef : 1.0 / dt;
+      const P = Math.pow(intensity, this.a) * Math.pow(Math.max(rate, 1e-4), this.b);
+      const { tauE, g, thr, rho, lam, kH, hH, dH } = this;
+      const E = this.E + (1.0 - Math.exp(-dt / tauE)) * (P - this.E);
+      const x = g * (E - thr - kH * this.H);
+      const de = softplus(x);
+      const k = rho * de + lam;
+      const A_ss = (rho * de) / k;
+      const A = A_ss + (this.A - A_ss) * Math.exp(-k * dt);
+      const H_ss = (hH * A) / dH;
+      this.E = E;
+      this.A = A;
+      this.H = H_ss + (this.H - H_ss) * Math.exp(-dH * dt);
+      return clamp(A, 0.0, 1.0);
+    }
+  }
+
+  // ---------------------------------------------------------------- setpoints / descriptors
+  function settle(hi, travel, dur, core, rateRef) {
+    const { a, b, g, thr, rho, lam, kH, hH, dH } = core;
+    const stim = rateRef !== null ? hi : travel;
+    const rate = rateRef !== null ? rateRef : 1.0 / Math.max(dur, 1e-3);
+    const P_ = Math.pow(clamp(stim, 1e-4, 1.0), a) * Math.pow(Math.max(rate, 1e-4), b);
+    const onepass = kH === 0.0 || hH === 0.0;
+    let A, de;
+    if (onepass) {
+      de = softplus(g * (P_ - thr));
+      A = (rho * de) / (rho * de + lam);
+    } else {
+      const c = (kH * hH) / dH;
+      let lo_ = 0.0, hi_ = 1.0;
+      for (let i = 0; i < 60; i++) {
+        const mid = 0.5 * (lo_ + hi_);
+        let f = softplus(g * (P_ - thr - c * mid));
+        f = (rho * f) / (rho * f + lam);
+        if (f < mid) hi_ = mid; else lo_ = mid;
+      }
+      A = 0.5 * (lo_ + hi_);
+      de = softplus(g * (P_ - thr - c * A));
+    }
+    return [A, rho * de + lam];
+  }
+
+  function setpointsBatch(Ps, core, rateRef) {
+    rateRef = rateRef === undefined ? null : rateRef;
+    const n = Ps.length;
+    const loA = new Array(n), hiA = new Array(n), tgt = new Array(n), rls = new Array(n);
+    const kb = new Array(n), ke = new Array(n), tb = new Array(n), db = new Array(n);
+    const te = new Array(n), de_ = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const [aim, rel, lo, span, dur_hi, dur_lo, , lfo_d] = Ps[i];
+      const hib = Math.min(1.0, lo + span), hie = Math.min(1.0, lo + EASE_SPAN * span);
+      const tB_ = hib - lo, tE_ = hie - lo;
+      const db_ = dur_hi * (1 - 0.5 * lfo_d), de__ = dur_lo * (1 + 0.5 * lfo_d);
+      const [hiA_i, kb_i] = settle(hib, tB_, db_, core, rateRef);
+      const [loA_i, ke_i] = settle(hie, tE_, de__, core, rateRef);
+      const hiA_c = Math.max(hiA_i, loA_i + BAND_MIN);
+      const tgt_i = loA_i + aim * (hiA_c - loA_i);
+      loA[i] = loA_i; hiA[i] = hiA_c; tgt[i] = tgt_i; rls[i] = loA_i + rel * (tgt_i - loA_i);
+      kb[i] = kb_i; ke[i] = ke_i; tb[i] = tB_; db[i] = db_; te[i] = tE_; de_[i] = de__;
+    }
+    return { loA, hiA, tgt, rls, kb, ke, tb, db, te, de: de_ };
+  }
+
+  function descriptorsBatch(Ps, core, rateRef) {
+    const sp = setpointsBatch(Ps, core, rateRef);
+    const n = Ps.length;
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const tB = -Math.log(Math.max((sp.hiA[i] - sp.tgt[i]) / Math.max(sp.hiA[i] - sp.rls[i], 1e-9), 1e-9)) / sp.kb[i];
+      const tE = -Math.log(Math.max((sp.rls[i] - sp.loA[i]) / Math.max(sp.tgt[i] - sp.loA[i], 1e-9), 1e-9)) / sp.ke[i];
+      out[i] = [sp.tb[i], sp.db[i], sp.te[i], sp.de[i], sp.tgt[i], Math.min(tB + tE, MAX_BUILD_S + MAX_EASE_S)];
+    }
+    return out;
+  }
+
+  // What a behaviour cell MEANS: the observed range of each descriptor axis over the reachable
+  // space, for THIS core. A fixed Python seed lets two runs of the SAME core agree to the bit;
+  // here there is no such requirement (a freshly-fit core has no Python run to agree with), so
+  // this just needs enough samples to be a stable estimate, which EXTENT_N=20000 already is.
+  function computeExtent(core, rateRef, rng, n) {
+    const C = rng.uniformBatch(POLICY_LO, POLICY_HI, n);
+    const B = descriptorsBatch(C, core, rateRef);
+    const dmin = new Array(DESC_NAMES.length).fill(Infinity);
+    const dmax = new Array(DESC_NAMES.length).fill(-Infinity);
+    for (const row of B) for (let i = 0; i < row.length; i++) {
+      if (row[i] < dmin[i]) dmin[i] = row[i];
+      if (row[i] > dmax[i]) dmax[i] = row[i];
+    }
+    return { dmin, drange: dmin.map((lo, i) => Math.max(dmax[i] - lo, 1e-9)) };
+  }
+
+  // ---------------------------------------------------------------- frozen CfC encoder
+  function lecun(x) { return LECUN_A * Math.tanh(LECUN_B * x); }
+
+  function matVec(W, x, bias) {
+    const out = new Array(W.length);
+    for (let i = 0; i < W.length; i++) {
+      let s = bias ? bias[i] : 0.0;
+      const row = W[i];
+      for (let j = 0; j < x.length; j++) s += row[j] * x[j];
+      out[i] = s;
+    }
+    return out;
+  }
+
+  function cfcFeatures(enc, hist, polN, descN) {
+    const w = enc.w;
+    if (!enc._cell4) {
+      const W4 = [], b4 = [];
+      for (const k of KEYS4) {
+        for (const row of w["cell." + k + ".weight"]) W4.push(row);
+        for (const bv of w["cell." + k + ".bias"]) b4.push(bv);
+      }
+      enc._cell4 = [W4, b4];
+    }
+    const [W4, b4] = enc._cell4;
+    const Wbb = w["cell.bb.weight"], bbb = w["cell.bb.bias"];
+    const n = NH_ENC;
+    let h = new Array(n).fill(0.0);
+    for (const row of hist) {
+      const v = row.concat(h);
+      const pre = matVec(Wbb, v, bbb).map(lecun);
+      const u = matVec(W4, pre, b4);
+      const hNew = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const gate = 1.0 / (1.0 + Math.exp(-(u[2 * n + i] * row[HROW_T] + u[3 * n + i])));
+        hNew[i] = Math.tanh(u[i]) * (1.0 - gate) + Math.tanh(u[n + i]) * gate;
+      }
+      h = hNew;
+    }
+    const mlp0W = w["mlp.0.weight"], mlp0b = w["mlp.0.bias"];
+    const mlp2W = w["mlp.2.weight"], mlp2b = w["mlp.2.bias"];
+    const out = new Array(polN.length);
+    for (let i = 0; i < polN.length; i++) {
+      const x = h.concat(polN[i], descN[i]);
+      let a = matVec(mlp0W, x, mlp0b);
+      a = a.map((v) => v / (1.0 + Math.exp(-v))); // SiLU
+      out[i] = matVec(mlp2W, a, mlp2b).map(Math.tanh);
+    }
+    return out;
+  }
+
+  function encBad(w, dmin, drange) {
+    if (!w["cell.bb.weight"] || !w["mlp.0.weight"]) return "cell.bb.weight or mlp.0.weight missing";
+    if (dmin.length !== DESC_NAMES.length || drange.length !== DESC_NAMES.length)
+      return "dmin/drange wrong length";
+    if (drange.some((v) => !isFinite(v) || v <= 0)) return "drange has a zero or non-finite axis";
+    return null;
+  }
+
+  // ---------------------------------------------------------------- RLS (Bayesian linear head)
+  function cholesky(A) {
+    const n = A.length;
+    const L = Array.from({ length: n }, () => new Array(n).fill(0.0));
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j <= i; j++) {
+        let s = 0.0;
+        for (let k = 0; k < j; k++) s += L[i][k] * L[j][k];
+        L[i][j] = i === j ? Math.sqrt(A[i][i] - s) : (A[i][j] - s) / L[j][j];
+      }
+    }
+    return L;
+  }
+
+  class RLS {
+    constructor(n, w, P) {
+      this.n = n;
+      this.w = w ? w.slice() : new Array(n).fill(0.0);
+      this.P = P ? P.map((r) => r.slice())
+                  : Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? RLS_P0 : 0.0)));
+      this._L = null;
+    }
+
+    update(phi, y) {
+      const Pp = matVec(this.P, phi, null);
+      let phiPp = 0.0;
+      for (let i = 0; i < this.n; i++) phiPp += phi[i] * Pp[i];
+      const denom = RLS_SIGMA * RLS_SIGMA + phiPp;
+      const K = Pp.map((v) => v / denom);
+      let phiw = 0.0;
+      for (let i = 0; i < this.n; i++) phiw += phi[i] * this.w[i];
+      const resid = y - phiw;
+      for (let i = 0; i < this.n; i++) this.w[i] += K[i] * resid;
+      for (let i = 0; i < this.n; i++) for (let j = 0; j < this.n; j++) this.P[i][j] -= K[i] * Pp[j];
+      for (let i = 0; i < this.n; i++) this.P[i][i] += RLS_Q;
+      this._L = null;
+    }
+
+    sample(PHI, rng) {
+      if (!this._L) {
+        const A = this.P.map((r) => r.slice());
+        for (let i = 0; i < this.n; i++) A[i][i] += 1e-9;
+        this._L = cholesky(A);
+      }
+      const noise = rng.standardNormal(this.n);
+      const Lz = matVec(this._L, noise, null);
+      const wPlus = this.w.map((v, i) => v + Lz[i]);
+      return PHI.map((phi) => {
+        let s = 0.0;
+        for (let i = 0; i < this.n; i++) s += phi[i] * wPlus[i];
+        return s;
+      });
+    }
+
+    dump() { return { w: this.w.slice(), P: this.P.map((r) => r.slice()) }; }
+  }
+
+  // ---------------------------------------------------------------- outcome / hist_row / hazard
+  function outcome(peak, cum, timedOut) {
+    const base = timedOut || peak === null || peak === undefined ? 0.0 : Number(peak);
+    return base - (cum ? CUM_COST : 0.0) - (timedOut ? TIMEOUT_COST : 0.0);
+  }
+
+  // Checked once at load, same as cumpredict.py's module-level assert: timeout+cum < timeout <
+  // any cum < clean cycle, so a cum can never outrank even the worst clean cycle.
+  (function checkOutcomeOrdering() {
+    const peaks = [null, 0.0, PEAK_MAX];
+    const cleans = peaks.filter((p) => p !== null).map((p) => outcome(p, false, false));
+    const cums = peaks.map((p) => outcome(p, true, false));
+    const tos = peaks.flatMap((p) => [outcome(p, false, true), outcome(p, true, true)]);
+    const ok = 0.0 < PEAK_MAX && PEAK_MAX < CUM_COST && CUM_COST < TIMEOUT_COST
+      && Math.max(...tos) < Math.min(...cums) && Math.max(...cums) < Math.min(...cleans);
+    if (!ok) throw new Error("outcome ordering broken");
+  })();
+
+  function histRow(p, peakA, cycleS, cum) {
+    const norm = p.map((v, i) => (v - POLICY_LO[i]) / POLICY_SPAN[i]);
+    return norm.concat([Number(peakA), Math.min(Number(cycleS), CYCLE_REF_S) / CYCLE_REF_S, cum ? 1.0 : 0.0]);
+  }
+
+  function cumHazard(A, dt, h0, sharp) {
+    return 1.0 - Math.exp(-dt * h0 * Math.exp(sharp * (Math.min(A, 1.0) - 1.0)));
+  }
+
+  // ---------------------------------------------------------------- CEM / fit_core / hazard fit
+  // Yielded to the event loop between chunks of work -- fitCore/trainEncoder run long enough
+  // (minutes) that a plain synchronous loop risks the browser's own "page unresponsive" warning,
+  // not just a stale-looking progress bar. Never awaited by the Node parity/verification scripts
+  // for anything faster than that, so this costs them nothing.
+  function yieldToUI() { return new Promise((resolve) => setTimeout(resolve, 0)); }
+
+  // Gradient-free cross-entropy method: sample a population from a Gaussian, keep the elite
+  // fraction, refit mean/std, repeat. bounds: array of [lo,hi] pairs. evalPop(P) -> array of
+  // losses, one per candidate (lower is better). opts.onProgress(r, it, restarts, iters, bestLoss).
+  async function cem(bounds, evalPop, rng, opts) {
+    opts = opts || {};
+    const iters = opts.iters || CEM_ITERS, pop = opts.pop || CEM_POP;
+    const elite = opts.elite || CEM_ELITE, restarts = opts.restarts || CEM_RESTARTS;
+    const lo = bounds.map((b) => b[0]), hi = bounds.map((b) => b[1]);
+    const n = lo.length, k = Math.max(3, Math.floor(pop * elite));
+    let best = null, bestLoss = Infinity;
+    for (let r = 0; r < restarts; r++) {
+      const z0 = rng.standardNormal(n);
+      let mean = lo.map((l, i) => clamp((l + hi[i]) / 2 + 0.25 * (hi[i] - l) * z0[i], l, hi[i]));
+      let std = lo.map((l, i) => (hi[i] - l) / 4.0);
+      for (let it = 0; it < iters; it++) {
+        const P = [];
+        for (let p = 0; p < pop; p++) {
+          const draw = rng.standardNormal(n);
+          P.push(mean.map((m, i) => clamp(m + std[i] * draw[i], lo[i], hi[i])));
+        }
+        if (best) P[0] = best.slice();
+        const L = evalPop(P);
+        const idx = L.map((_, i) => i).sort((a, b) => L[a] - L[b]).slice(0, k);
+        const newMean = new Array(n).fill(0);
+        for (const i of idx) for (let d = 0; d < n; d++) newMean[d] += P[i][d];
+        for (let d = 0; d < n; d++) newMean[d] /= idx.length;
+        const newStd = new Array(n).fill(0);
+        for (const i of idx) for (let d = 0; d < n; d++) newStd[d] += (P[i][d] - newMean[d]) ** 2;
+        for (let d = 0; d < n; d++) newStd[d] = Math.sqrt(newStd[d] / idx.length) + 1e-3 * (hi[d] - lo[d]);
+        mean = newMean; std = newStd;
+        if (L[idx[0]] < bestLoss) { bestLoss = L[idx[0]]; best = P[idx[0]].slice(); }
+        if (opts.onProgress) opts.onProgress(r, it, restarts, iters, bestLoss);
+        await yieldToUI();
+      }
+    }
+    return { best, bestLoss };
+  }
+
+  // The loss fit_core optimizes: pinball loss at tau=0.75 (asymmetric -- under-predicting his
+  // reported arousal costs more than over-predicting it), per-session normalized by that
+  // session's own label weight so every session counts equally regardless of length, averaged
+  // across sessions, plus a resting-sanity penalty (zero-stimulation arousal must decay, or a
+  // leaky gate stalls every Director policy forever). Computed via CoreStreamer stepped through
+  // each session -- not numpy's memory-optimized padded/chunked batch scan, which exists purely
+  // for fitting speed at multi-hundred-session corpora and buys nothing at browser/personal-
+  // corpus scale (cumpredict.py documents the streamer and the batch scan as bit-identical).
+  function fitCoreLoss(core, pool) {
+    let total = 0;
+    for (const sess of pool) {
+      const cs = new CoreStreamer(core, null);
+      let acc = 0, wsum = 0;
+      for (let i = 0; i < sess.durS.length; i++) {
+        const A = cs.step(sess.intensity[i], sess.durS[i]);
+        const resid = sess.y[i] - A;
+        acc += Math.max(0.75 * resid, -0.25 * resid) * sess.w[i];
+        wsum += sess.w[i];
+      }
+      total += acc / (wsum + 1e-8);
+    }
+    const meanLoss = total / pool.length;
+    const de = softplus(core.g * -core.thr);
+    const rest = (core.rho * de) / (core.rho * de + core.lam);
+    return meanLoss + REST_PENALTY * rest * rest;
+  }
+
+  async function fitCore(sessions, rng, opts) {
+    const pool = sessions.slice();
+    for (const s of sessions) for (let a = 0; a < N_AUG; a++) pool.push(augmentRaw(s, rng));
+    const evalPop = (P) => P.map((params) => {
+      const core = {};
+      CORE_NAMES.forEach((k, i) => { core[k] = params[i]; });
+      return fitCoreLoss(core, pool);
+    });
+    const { best, bestLoss } = await cem(CORE_BOUNDS, evalPop, rng, opts);
+    const core = {};
+    CORE_NAMES.forEach((k, i) => { core[k] = best[i]; });
+    return { core, loss: bestLoss };
+  }
+
+  // First-cum hazard: h0*exp(sharp*(A-1)), max-likelihood over a small grid, no-cum sessions
+  // censored (every session contributes, whether or not it reached an orgasm).
+  function fitFirstCumHazard(sessions, core) {
+    const tracks = [];
+    for (const s of sessions) {
+      const cs = new CoreStreamer(core, null);
+      const A = new Array(s.durS.length);
+      for (let i = 0; i < s.durS.length; i++) A[i] = cs.step(s.intensity[i], s.durS[i]);
+      const c = cumOnsets(s.tS, s.pressIdx, s.pressVals);
+      let end = A.length;
+      if (c.length) {
+        let idx = s.tS.length;
+        for (let k = 0; k < s.tS.length; k++) if (s.tS[k] >= c[0]) { idx = k; break; }
+        end = idx + 1;
+      }
+      tracks.push({ A: A.slice(0, end).map((v) => clamp(v, 0, 1)), d: s.durS.slice(0, end), ev: c.length > 0 });
+    }
+    const sharps = [];
+    for (let s = 4.0; s <= 25.0; s += 1.0) sharps.push(s);
+    const NH0 = 90, loLog = Math.log(1e-5), hiLog = Math.log(0.5);
+    const h0s = Array.from({ length: NH0 }, (_, i) => Math.exp(loLog + ((hiLog - loLog) * i) / (NH0 - 1)));
+    let bi = 0, bj = 0, bv = Infinity;
+    for (let si = 0; si < sharps.length; si++) {
+      const sharp = sharps[si];
+      const nllRow = new Array(NH0).fill(0);
+      for (const { A, d, ev } of tracks) {
+        const ex = A.map((a) => Math.exp(sharp * (a - 1.0)));
+        let exdSum = 0;
+        for (let k = 0; k < ex.length; k++) exdSum += ex[k] * d[k];
+        for (let hj = 0; hj < NH0; hj++) nllRow[hj] += h0s[hj] * exdSum;
+        if (ev) {
+          const exLast = ex[ex.length - 1];
+          for (let hj = 0; hj < NH0; hj++) nllRow[hj] -= Math.log(Math.max(h0s[hj] * exLast, 1e-12));
+        }
+      }
+      for (let hj = 0; hj < NH0; hj++) if (nllRow[hj] < bv) { bv = nllRow[hj]; bi = si; bj = hj; }
+    }
+    if (bi === 0 || bi === sharps.length - 1 || bj === 0 || bj === NH0 - 1)
+      console.warn(`  WARNING: hazard pinned at a scan edge (sharp=${sharps[bi].toFixed(0)}, h0=${h0s[bj].toFixed(5)}) -- the likelihood wants to leave the grid.`);
+    return { h0: h0s[bj], sharp: sharps[bi] };
+  }
+
+  // ---------------------------------------------------------------- RNG
+  // uniform/uniformBatch/standardNormal are pure transforms of a .random() draw -- defined ONCE
+  // here and shared by both RNGs below, which differ only in what .random() itself does.
+  class BaseRNG {
+    uniform(lo, hi) { return lo.map((l, i) => l + (hi[i] - l) * this.random()); }
+    uniformBatch(lo, hi, rows) {
+      const out = [];
+      for (let r = 0; r < rows; r++) out.push(this.uniform(lo, hi));
+      return out;
+    }
+    standardNormal(n) {
+      const out = [];
+      while (out.length < n) {
+        const u1 = Math.max(this.random(), 1e-12), u2 = this.random();
+        const r = Math.sqrt(-2.0 * Math.log(u1));
+        out.push(r * Math.cos(2 * Math.PI * u2), r * Math.sin(2 * Math.PI * u2));
+      }
+      return out.slice(0, n);
+    }
+  }
+
+  // The default runtime RNG for a real session -- statistically reasonable, no need to match
+  // Python's numbers (see TestRNG below for the one case that does).
+  class RuntimeRNG extends BaseRNG {
+    random() { return Math.random(); }
+  }
+
+  // Test-only deterministic RNG (mulberry32), paired bit-for-bit with the Python TestRNG in the
+  // repo's dev tooling -- used only to replay parity checks, never at runtime.
+  class TestRNG extends BaseRNG {
+    constructor(seed) { super(); this.state = seed >>> 0; }
+
+    _u32() {
+      this.state = (this.state + 0x6d2b79f5) >>> 0;
+      let t = this.state;
+      t = Math.imul(t ^ (t >>> 15), t | 1) >>> 0;
+      const inner = Math.imul(t ^ (t >>> 7), t | 61) >>> 0;
+      t = (t ^ (t + inner)) >>> 0;
+      return (t ^ (t >>> 14)) >>> 0;
+    }
+
+    random() { return this._u32() / 4294967296.0; }
+  }
+
+  // ---------------------------------------------------------------- Director
+  class Director {
+    constructor(rng, core, prior, encoder, extent) {
+      this.rng = rng;
+      this.core = core;
+      prior = prior || {};
+      const namesEq = (a, b) => a && b && a.length === b.length && a.every((v, i) => v === b[i]);
+      const ok = namesEq(prior.names, POLICY_NAMES) && namesEq(prior.desc, DESC_NAMES)
+        && prior.reward && prior.reward[0] === CUM_COST && prior.reward[1] === TIMEOUT_COST
+        && (!encoder || prior.predictor === encoder.predictor);
+      this.trials = ok ? (prior.trials || []).slice() : [];
+      this.mod = String(prior.modality || "linear");
+      this.rateRef = this.mod === "vib" ? VIB_RATE_REF : null;
+      this.bias = 0.0;
+      this.t = this.phaseT = 0.0;
+      this.cycles = 0; this.timeouts = 0; this.phase = "build";
+      this.enc = encoder || null;
+      const hd = ok && prior.heads && ["press", "cum", "to"].every((k) => prior.heads[k]
+        && prior.heads[k].w && prior.heads[k].w.length === NF_ENC
+        && prior.heads[k].P && prior.heads[k].P.length === NF_ENC) ? prior.heads : null;
+      this.heads = this.enc ? {
+        press: new RLS(NF_ENC, hd && hd.press.w, hd && hd.press.P),
+        cum: new RLS(NF_ENC, hd && hd.cum.w, hd && hd.cum.P),
+        to: new RLS(NF_ENC, hd && hd.to.w, hd && hd.to.P),
+      } : null;
+      this.hist = (ok ? (prior.cycle_hist || []) : []).slice(-HIST_ENC);
+      this._extentTable = extent || null;
+      this._setExtent();
+      this.startCycle();
+    }
+
+    // `extent` given at construction (the shipped model's precomputed table) is used if it has
+    // this rateRef's entry; otherwise computed fresh -- needed for a just-fit core during
+    // training, which has no precomputed table. Cached per (core,modality) on the class itself
+    // (mirrors cumpredict.py's Director._EXTENT) so encoder_dataset/train_encoder building a
+    // second Director for the same core doesn't re-pay the EXTENT_N-sample cost.
+    _setExtent() {
+      if (this._extentTable) {
+        const e = this.rateRef === null ? this._extentTable.linear : this._extentTable.vib;
+        if (e) { this.dmin = e.dmin.slice(); this.drange = e.drange.slice(); return; }
+      }
+      const key = CORE_NAMES.map((k) => this.core[k]).join(",") + "|" + (this.rateRef === null ? "linear" : "vib");
+      if (!Director._EXTENT_CACHE.has(key))
+        Director._EXTENT_CACHE.set(key, computeExtent(this.core, this.rateRef, this.rng, EXTENT_N));
+      const c = Director._EXTENT_CACHE.get(key);
+      this.dmin = c.dmin.slice();
+      this.drange = c.drange.slice();
+    }
+
+    features(P, desc) {
+      const H = this.hist.slice(-HIST_ENC);
+      const b = desc || descriptorsBatch(P, this.core, this.rateRef);
+      const polN = P.map((p) => p.map((v, i) => (v - POLICY_LO[i]) / POLICY_SPAN[i]));
+      const descN = b.map((row) => row.map((v, i) => (v - this.enc.dmin[i]) / this.enc.drange[i]));
+      return cfcFeatures(this.enc, H, polN, descN);
+    }
+
+    cells(P, desc) {
+      const b = desc || descriptorsBatch(P, this.core, this.rateRef);
+      return b.map((row) => row.map((v, i) => Math.min(Math.max(Math.floor(((v - this.dmin[i]) / this.drange[i]) * NBIN), 0), NBIN - 1)).join(","));
+    }
+
+    cell(p) { return this.cells([p])[0]; }
+
+    _draw() {
+      if (!this.heads) return this.rng.uniform(POLICY_LO, POLICY_HI);
+      if (this.rng.random() < EPS_UNIFORM) {
+        const q = this.rng.uniform(POLICY_LO, POLICY_HI);
+        this._phi = this.features([q])[0];
+        return q;
+      }
+      const C = this.rng.uniformBatch(POLICY_LO, POLICY_HI, NN_CAND);
+      const B = descriptorsBatch(C, this.core, this.rateRef);
+      const PHI = this.features(C, B);
+      const sPress = this.heads.press.sample(PHI, this.rng);
+      const sCum = this.heads.cum.sample(PHI, this.rng);
+      const sTo = this.heads.to.sample(PHI, this.rng);
+      const val = sPress.map((v, i) => v - CUM_COST * clamp(sCum[i], 0, 1) - TIMEOUT_COST * clamp(sTo[i], 0, 1));
+      const recent = new Set(this.trials.slice(-RECENT_CELLS).map((t) => t.cell).filter(Boolean));
+      const cellsC = this.cells(C, B);
+      const fresh = cellsC.map((c) => !recent.has(c));
+      const anyFresh = fresh.some(Boolean);
+      let best = -Infinity, k = 0;
+      for (let i = 0; i < val.length; i++) {
+        const v = anyFresh && !fresh[i] ? -1e9 : val[i];
+        if (v > best) { best = v; k = i; }
+      }
+      this._phi = PHI[k];
+      return C[k];
+    }
+
+    _band() {
+      const pf = this.p.slice();
+      this._pf = pf;
+      const r3 = (x) => Math.round(x * 1000) / 1000;
+      this._win = [r3(pf[2]), r3(Math.min(1.0, pf[2] + pf[3])), r3(Math.min(1.0, pf[2] + EASE_SPAN * pf[3]))];
+      const sp = setpointsBatch([this.p], this.core, this.rateRef);
+      this.target = clamp(sp.tgt[0] + this.bias, 0.0, 1.0);
+      this.release = Math.min(clamp(sp.rls[0] + this.bias, 0.0, 1.0), this.target);
+    }
+
+    startCycle(p) {
+      this.p = p || this._draw();
+      this._band();
+      this.phase = "build"; this.phaseT = 0.0;
+      this.peakA = 0.0;
+      this.peak = null;
+      this.timedOut = false;
+    }
+
+    censorCycle() { this.startCycle(); }
+
+    setModality(tag) {
+      this.rateRef = tag === "vib" ? VIB_RATE_REF : null;
+      this._setExtent();
+      if (tag !== this.mod) { this.mod = tag; this.resetPrior(); }
+    }
+
+    notePress(press) {
+      press = Number(press);
+      if (press < CUM_THR) this.peak = this.peak === null ? press : Math.max(this.peak, press);
+    }
+
+    closeCycle(cum) {
+      cum = !!cum;
+      const peak = this.peak;
+      this.timeouts += this.timedOut ? 1 : 0;
+      this.cycles += 1;
+      const rated = this.peak !== null || cum || this.timedOut;
+      const r = rated ? outcome(this.peak, cum, this.timedOut) : null;
+      if (rated) {
+        if (this.heads) {
+          this.heads.press.update(this._phi, this.timedOut ? 0.0 : Number(peak || 0.0));
+          this.heads.cum.update(this._phi, cum ? 1.0 : 0.0);
+          this.heads.to.update(this._phi, this.timedOut ? 1.0 : 0.0);
+        }
+        this.trials.push({
+          p: this.p.slice(), reward: r, cell: this.cell(this.p), peak: this.peak, cum,
+          timeout: this.timedOut, bias: Math.round(this.bias * 1e4) / 1e4,
+          target: Math.round(this.target * 1e4) / 1e4, release: Math.round(this.release * 1e4) / 1e4,
+          mod: this.mod, cycle_s: Math.round(this.phaseT * 100) / 100,
+        });
+      }
+      if (this.heads) {
+        this.hist.push(histRow(this.p, this.peakA, this.phaseT, cum));
+        this.hist = this.hist.slice(-HIST_ENC);
+      }
+      this.startCycle();
+    }
+
+    observe(press, A) { this.bias += BIAS_LR * (press - A - this.bias); }
+
+    corrected(A) { return clamp(Number(A) + this.bias, 0.0, 1.0); }
+
+    commitObservation(A, dt, cum) {
+      cum = !!cum;
+      const Ah = this.corrected(A);
+      this.peakA = Math.max(this.peakA, Number(A));
+      this.t += dt; this.phaseT += dt;
+      if (cum) {
+        this.closeCycle(true);
+      } else if (Ah >= this.target || this.phaseT > MAX_BUILD_S) {
+        this.timedOut = this.timedOut || this.phaseT > MAX_BUILD_S;
+        this.closeCycle(false);
+      }
+    }
+
+    nextAction() {
+      const [loR, hiB] = this._win;
+      const [, , , , durHi, , lfoS, lfoD] = this._pf;
+      const w = 0.5 + 0.5 * Math.sin((2 * Math.PI * this.t) / lfoS);
+      const dur = durHi * (1.0 - lfoD * w);
+      return [loR, hiB, Math.round(Math.max(dur, 0.1) * 1000) / 1000];
+    }
+
+    resetPrior() {
+      this.trials = [];
+      this.hist = [];
+      this.heads = this.enc ? { press: new RLS(NF_ENC), cum: new RLS(NF_ENC), to: new RLS(NF_ENC) } : null;
+      this.startCycle();
+    }
+
+    prior(predictor, modality) {
+      return {
+        predictor, modality, names: POLICY_NAMES.slice(),
+        reward: [CUM_COST, TIMEOUT_COST], desc: DESC_NAMES.slice(),
+        trials: this.trials.slice(-120),
+        heads: this.heads ? { press: this.heads.press.dump(), cum: this.heads.cum.dump(), to: this.heads.to.dump() } : {},
+        cycle_hist: this.hist.slice(-HIST_ENC),
+      };
+    }
+  }
+  Director._EXTENT_CACHE = new Map();
+
+  // ---------------------------------------------------------------- encoder_dataset
+  // What the encoder learns from: run cycles on the NOMINAL plant and record, for each policy,
+  // the history that preceded it and what it went on to reach. Dynamics only -- no keypress, no
+  // reward, no preference. Every policy is drawn UNIFORMLY at random (not the Director's own
+  // Thompson-sampled choice) so the training set covers the whole policy space, not just what a
+  // partially-trained head would explore.
+  async function encoderDataset(core, haz, rng, opts) {
+    opts = opts || {};
+    const n = opts.n || 3000, hs = opts.hs || HIST_ENC, m = opts.m || 6;
+    const [h0, sharp] = haz;
+    const LIM = MAX_BUILD_S + MAX_EASE_S + 30.0;
+
+    function one(d, q, st) {
+      d.startCycle(q);
+      let [lo, hi, dur] = d.nextAction();
+      let t = 0.0, c0 = d.cycles, pk = 0.0, cum = false;
+      while (t < LIM) {
+        const A = st.step(hi - lo, dur);
+        t += dur;
+        pk = Math.max(pk, A);
+        cum = rng.random() < cumHazard(A, dur, h0, sharp);
+        if (cum) st.refract();
+        d.commitObservation(A, dur, cum);
+        if (d.cycles !== c0) break;
+        [lo, hi, dur] = d.nextAction();
+      }
+      if (d.cycles === c0)
+        throw new Error(`encoderDataset: a cycle ran ${t.toFixed(0)}s without closing, past both deadlines (${MAX_BUILD_S.toFixed(0)}+${MAX_EASE_S.toFixed(0)}s). The rollout and the deadlines disagree.`);
+      return [pk, t, cum ? 1.0 : 0.0];
+    }
+
+    // ONE Director for the whole corpus (constructing one pays an _extent(); building n of them
+    // would re-measure an identical descriptor grid n times). No encoder passed -- start_cycle
+    // is always given an explicit q below, so _draw() (the only thing that would need heads) is
+    // never called, matching cumpredict.py's Director(rng, p) with encoder=None here.
+    const d = new Director(rng, core, null, null, null);
+    const hist = [], pol = [], y = [];
+    let b = 0;
+    while (b < n) {
+      const st = new CoreStreamer(core, null); // one body per chain, no state crosses a chain
+      const ring = [];
+      for (let j = 0; j < hs + m; j++) {
+        const q = rng.uniform(POLICY_LO, POLICY_HI);
+        const [pk, t, cq] = one(d, q, st);
+        if (j >= hs && b < n) {
+          hist.push(ring.slice(-hs));
+          pol.push(q);
+          y.push([pk, Math.min(t, CYCLE_REF_S) / CYCLE_REF_S]);
+          b += 1;
+        }
+        ring.push(histRow(q, pk, t, cq));
+      }
+      if (opts.onProgress) opts.onProgress(b, n);
+      await yieldToUI();
+    }
+    return { hist, pol, y };
+  }
+
+  // ---------------------------------------------------------------- minimal autodiff
+  // Reverse-mode, 2D [rows,cols] tensors only, and only the handful of ops the CfC Cell+Enc
+  // architecture (below) actually uses -- not a general framework. Each op returns a node
+  // carrying its own backward closure; backwardFrom() topologically sorts from a scalar loss and
+  // runs them in reverse, exactly the textbook construction (a la micrograd), so correctness
+  // reduces to "is each op's backward the right local derivative", checked per-op against finite
+  // differences and, for the whole network at once, against real PyTorch .backward() output --
+  // see the repo's autodiff parity tooling.
+  function tensor(data, rows, cols, parents, backward) {
+    return { data: Float64Array.from(data), rows, cols, grad: new Float64Array(rows * cols),
+             parents: parents || [], backward: backward || null };
+  }
+  function zerosTensor(rows, cols) { return tensor(new Float64Array(rows * cols), rows, cols, [], null); }
+  function paramFlat(flatNested, rows, cols) {
+    const flat = Array.isArray(flatNested[0]) ? flatNested.flat() : flatNested;
+    return tensor(flat, rows, cols, [], null);
+  }
+
+  function backwardFrom(lossNode) {
+    const topo = [], visited = new Set();
+    (function visit(n) {
+      if (visited.has(n)) return;
+      visited.add(n);
+      for (const p of n.parents) visit(p);
+      topo.push(n);
+    })(lossNode);
+    lossNode.grad[0] = 1.0;
+    for (let i = topo.length - 1; i >= 0; i--) if (topo[i].backward) topo[i].backward();
+  }
+
+  function tAdd(a, b) {
+    const n = a.data.length, data = new Float64Array(n);
+    for (let i = 0; i < n; i++) data[i] = a.data[i] + b.data[i];
+    return tensor(data, a.rows, a.cols, [a, b], function () {
+      for (let i = 0; i < n; i++) { a.grad[i] += this.grad[i]; b.grad[i] += this.grad[i]; }
+    });
+  }
+  function tMul(a, b) {
+    const n = a.data.length, data = new Float64Array(n);
+    for (let i = 0; i < n; i++) data[i] = a.data[i] * b.data[i];
+    return tensor(data, a.rows, a.cols, [a, b], function () {
+      for (let i = 0; i < n; i++) { a.grad[i] += this.grad[i] * b.data[i]; b.grad[i] += this.grad[i] * a.data[i]; }
+    });
+  }
+  function tScale(a, c) {
+    const n = a.data.length, data = new Float64Array(n);
+    for (let i = 0; i < n; i++) data[i] = a.data[i] * c;
+    return tensor(data, a.rows, a.cols, [a], function () {
+      for (let i = 0; i < n; i++) a.grad[i] += this.grad[i] * c;
+    });
+  }
+  function tOneMinus(a) {
+    const n = a.data.length, data = new Float64Array(n);
+    for (let i = 0; i < n; i++) data[i] = 1.0 - a.data[i];
+    return tensor(data, a.rows, a.cols, [a], function () {
+      for (let i = 0; i < n; i++) a.grad[i] -= this.grad[i];
+    });
+  }
+  function tTanh(a) {
+    const n = a.data.length, data = new Float64Array(n);
+    for (let i = 0; i < n; i++) data[i] = Math.tanh(a.data[i]);
+    return tensor(data, a.rows, a.cols, [a], function () {
+      for (let i = 0; i < n; i++) a.grad[i] += this.grad[i] * (1 - data[i] * data[i]);
+    });
+  }
+  function tSigmoid(a) {
+    const n = a.data.length, data = new Float64Array(n);
+    for (let i = 0; i < n; i++) data[i] = 1 / (1 + Math.exp(-a.data[i]));
+    return tensor(data, a.rows, a.cols, [a], function () {
+      for (let i = 0; i < n; i++) a.grad[i] += this.grad[i] * data[i] * (1 - data[i]);
+    });
+  }
+  function tMulCol(a, col) { // a:[B,F] * col:[B,1], broadcast col over F
+    const B = a.rows, F = a.cols, data = new Float64Array(B * F);
+    for (let i = 0; i < B; i++) for (let j = 0; j < F; j++) data[i * F + j] = a.data[i * F + j] * col.data[i];
+    return tensor(data, B, F, [a, col], function () {
+      for (let i = 0; i < B; i++) {
+        let cs = 0;
+        for (let j = 0; j < F; j++) {
+          const g = this.grad[i * F + j];
+          a.grad[i * F + j] += g * col.data[i];
+          cs += g * a.data[i * F + j];
+        }
+        col.grad[i] += cs;
+      }
+    });
+  }
+  function tCol(x, colIdx) { // extract column colIdx as [B,1]
+    const B = x.rows, data = new Float64Array(B);
+    for (let i = 0; i < B; i++) data[i] = x.data[i * x.cols + colIdx];
+    return tensor(data, B, 1, [x], function () {
+      for (let i = 0; i < B; i++) x.grad[i * x.cols + colIdx] += this.grad[i];
+    });
+  }
+  function tLinear(x, W, b) { // x:[B,in], W:[out,in] (torch layout), b:[out] -> [B,out]
+    const B = x.rows, IN = x.cols, OUT = W.rows, data = new Float64Array(B * OUT);
+    for (let i = 0; i < B; i++) {
+      for (let o = 0; o < OUT; o++) {
+        let s = b.data[o];
+        for (let k = 0; k < IN; k++) s += x.data[i * IN + k] * W.data[o * IN + k];
+        data[i * OUT + o] = s;
+      }
+    }
+    return tensor(data, B, OUT, [x, W, b], function () {
+      for (let i = 0; i < B; i++) {
+        for (let o = 0; o < OUT; o++) {
+          const g = this.grad[i * OUT + o];
+          b.grad[o] += g;
+          for (let k = 0; k < IN; k++) {
+            x.grad[i * IN + k] += g * W.data[o * IN + k];
+            W.grad[o * IN + k] += g * x.data[i * IN + k];
+          }
+        }
+      }
+    });
+  }
+  function tConcat(parts) { // along axis 1, all same rows
+    const B = parts[0].rows, cols = parts.map((p) => p.cols);
+    const total = cols.reduce((a, b) => a + b, 0);
+    const offs = [0];
+    for (const c of cols) offs.push(offs[offs.length - 1] + c);
+    const data = new Float64Array(B * total);
+    for (let i = 0; i < B; i++)
+      for (let p = 0; p < parts.length; p++)
+        for (let j = 0; j < cols[p]; j++) data[i * total + offs[p] + j] = parts[p].data[i * cols[p] + j];
+    return tensor(data, B, total, parts.slice(), function () {
+      for (let i = 0; i < B; i++)
+        for (let p = 0; p < parts.length; p++)
+          for (let j = 0; j < cols[p]; j++) parts[p].grad[i * cols[p] + j] += this.grad[i * total + offs[p] + j];
+    });
+  }
+  function tWhereCol(condCol, a, b) { // condCol: plain array[B] of 0/1 (data, not a param -- no grad needed)
+    const B = a.rows, F = a.cols, data = new Float64Array(B * F);
+    for (let i = 0; i < B; i++) {
+      const c = condCol[i] ? 1 : 0;
+      for (let j = 0; j < F; j++) data[i * F + j] = c ? a.data[i * F + j] : b.data[i * F + j];
+    }
+    return tensor(data, B, F, [a, b], function () {
+      for (let i = 0; i < B; i++) {
+        const c = condCol[i] ? 1 : 0;
+        for (let j = 0; j < F; j++) { const g = this.grad[i * F + j]; if (c) a.grad[i * F + j] += g; else b.grad[i * F + j] += g; }
+      }
+    });
+  }
+  function tMeanSquareDiff(pred, target) { // scalar = mean((pred-target)^2) over all elements
+    const n = pred.data.length;
+    const diff = new Float64Array(n);
+    let s = 0;
+    for (let i = 0; i < n; i++) { diff[i] = pred.data[i] - target.data[i]; s += diff[i] * diff[i]; }
+    return tensor([s / n], 1, 1, [pred], function () {
+      const g = (this.grad[0] * 2) / n;
+      for (let i = 0; i < n; i++) pred.grad[i] += g * diff[i];
+    });
+  }
+
+  // ---------------------------------------------------------------- CfC Cell + Enc (trainable)
+  // Mirrors cumpredict.py's train_encoder Cell/Enc classes op-for-op. `head` exists only to give
+  // the 32-dim feature output something to train against (peak, cycle_s) -- it is never exported;
+  // cfcFeatures() above is what ships, and matches phi() here by construction (same weight keys).
+  function initLinearParams(inDim, outDim, rng) {
+    const bound = 1 / Math.sqrt(inDim);
+    const W = new Float64Array(outDim * inDim), b = new Float64Array(outDim);
+    for (let i = 0; i < W.length; i++) W[i] = (rng.random() * 2 - 1) * bound;
+    for (let i = 0; i < b.length; i++) b[i] = (rng.random() * 2 - 1) * bound;
+    return { W: tensor(W, outDim, inDim, [], null), b: tensor(b, outDim, 1, [], null) };
+  }
+  function loadLinearParams(w) {
+    return { W: paramFlat(w.weight, w.weight.length, w.weight[0].length), b: paramFlat(w.bias, w.bias.length, 1) };
+  }
+
+  class CfcCell {
+    constructor(din, h, bb, rngOrWeights) {
+      this.h = h;
+      const isInit = rngOrWeights && typeof rngOrWeights.random === "function";
+      this.bb = isInit ? initLinearParams(din + h, bb, rngOrWeights) : loadLinearParams(rngOrWeights.bb);
+      this.ff1 = isInit ? initLinearParams(bb, h, rngOrWeights) : loadLinearParams(rngOrWeights.ff1);
+      this.ff2 = isInit ? initLinearParams(bb, h, rngOrWeights) : loadLinearParams(rngOrWeights.ff2);
+      this.ta = isInit ? initLinearParams(bb, h, rngOrWeights) : loadLinearParams(rngOrWeights.ta);
+      this.tb = isInit ? initLinearParams(bb, h, rngOrWeights) : loadLinearParams(rngOrWeights.tb);
+    }
+
+    forward(x, hid, tsCol) {
+      const z0 = tLinear(tConcat([x, hid]), this.bb.W, this.bb.b);
+      const z = tScale(tTanh(tScale(z0, LECUN_B)), LECUN_A);
+      const gPre = tAdd(tMulCol(tLinear(z, this.ta.W, this.ta.b), tsCol), tLinear(z, this.tb.W, this.tb.b));
+      const gate = tSigmoid(gPre);
+      const f1 = tTanh(tLinear(z, this.ff1.W, this.ff1.b));
+      const f2 = tTanh(tLinear(z, this.ff2.W, this.ff2.b));
+      return tAdd(tMul(f1, tOneMinus(gate)), tMul(f2, gate));
+    }
+
+    params() { return [this.bb, this.ff1, this.ff2, this.ta, this.tb].flatMap((l) => [l.W, l.b]); }
+  }
+
+  class CfcEnc {
+    constructor(rngOrWeights) {
+      const isInit = rngOrWeights && typeof rngOrWeights.random === "function";
+      this.cell = new CfcCell(HROW, NH_ENC, 128, isInit ? rngOrWeights : rngOrWeights.cell);
+      const mlpIn = NH_ENC + POLICY_NAMES.length + DESC_NAMES.length;
+      this.mlp0 = isInit ? initLinearParams(mlpIn, 64, rngOrWeights) : loadLinearParams(rngOrWeights.mlp0);
+      this.mlp2 = isInit ? initLinearParams(64, NF_ENC, rngOrWeights) : loadLinearParams(rngOrWeights.mlp2);
+      this.head = isInit ? initLinearParams(NF_ENC, 2, rngOrWeights) : loadLinearParams(rngOrWeights.head);
+    }
+
+    // histBatch: array of T tensors [B,HROW] (one per timestep). keepBatch: array of T plain
+    // arrays[B] of 0/1, or null to always keep (no masking -- full history every step).
+    phi(histBatch, pol, desc, keepBatch) {
+      let h = zerosTensor(pol.rows, NH_ENC);
+      for (let t = 0; t < histBatch.length; t++) {
+        const tsCol = tCol(histBatch[t], HROW_T);
+        const nh = this.cell.forward(histBatch[t], h, tsCol);
+        h = keepBatch ? tWhereCol(keepBatch[t], nh, h) : nh;
+      }
+      const catted = tConcat([h, pol, desc]);
+      const a0 = tLinear(catted, this.mlp0.W, this.mlp0.b);
+      const a0silu = tMul(a0, tSigmoid(a0));
+      const a2 = tLinear(a0silu, this.mlp2.W, this.mlp2.b);
+      return tTanh(a2);
+    }
+
+    forward(histBatch, pol, desc, keepBatch) {
+      return tLinear(this.phi(histBatch, pol, desc, keepBatch), this.head.W, this.head.b);
+    }
+
+    params() { return [...this.cell.params(), this.mlp0.W, this.mlp0.b, this.mlp2.W, this.mlp2.b, this.head.W, this.head.b]; }
+
+    // {cell.bb.weight: [[...]], ...} -- exactly enc_shapes()'s key set, nothing else (no head).
+    // Rounded to 6dp like cumpredict.py's export, purely to keep the shipped JSON smaller; the
+    // numpy/autodiff parity gate below is toleranced for exactly this rounding.
+    exportWeights() {
+      const r6 = (v) => Math.round(v * 1e6) / 1e6;
+      const flat2d = (t) => Array.from({ length: t.rows }, (_, i) => Array.from(t.data.slice(i * t.cols, (i + 1) * t.cols), r6));
+      const flat1d = (t) => Array.from(t.data, r6);
+      const w = {};
+      for (const [name, l] of [["bb", this.cell.bb], ["ff1", this.cell.ff1], ["ff2", this.cell.ff2],
+                                ["ta", this.cell.ta], ["tb", this.cell.tb]]) {
+        w[`cell.${name}.weight`] = flat2d(l.W); w[`cell.${name}.bias`] = flat1d(l.b);
+      }
+      w["mlp.0.weight"] = flat2d(this.mlp0.W); w["mlp.0.bias"] = flat1d(this.mlp0.b);
+      w["mlp.2.weight"] = flat2d(this.mlp2.W); w["mlp.2.bias"] = flat1d(this.mlp2.b);
+      return w;
+    }
+  }
+
+  // Adam, textbook form (beta1=.9 beta2=.999 eps=1e-8), matching torch.optim.Adam's defaults --
+  // the only optimizer cumpredict.py's train_encoder uses.
+  class Adam {
+    constructor(params, lr) {
+      this.params = params; this.lr = lr; this.t = 0;
+      this.m = params.map((p) => new Float64Array(p.data.length));
+      this.v = params.map((p) => new Float64Array(p.data.length));
+    }
+    step() {
+      this.t += 1;
+      const b1 = 0.9, b2 = 0.999, eps = 1e-8;
+      const bc1 = 1 - Math.pow(b1, this.t), bc2 = 1 - Math.pow(b2, this.t);
+      for (let p = 0; p < this.params.length; p++) {
+        const P = this.params[p], m = this.m[p], v = this.v[p];
+        for (let i = 0; i < P.data.length; i++) {
+          const g = P.grad[i];
+          m[i] = b1 * m[i] + (1 - b1) * g;
+          v[i] = b2 * v[i] + (1 - b2) * g * g;
+          P.data[i] -= (this.lr * (m[i] / bc1)) / (Math.sqrt(v[i] / bc2) + eps);
+        }
+      }
+    }
+    zeroGrad() { for (const p of this.params) p.grad.fill(0); }
+  }
+
+  // ---------------------------------------------------------------- train_encoder
+  function gatherHistBatch(hist, indices, T) {
+    const batch = [];
+    for (let t = 0; t < T; t++) {
+      const rows = indices.map((idx) => hist[idx][t]);
+      batch.push(tensor(rows.flat(), rows.length, rows[0].length, [], null));
+    }
+    return batch;
+  }
+  function gatherRowsBatch(arr, indices) {
+    const rows = indices.map((idx) => arr[idx]);
+    return tensor(rows.flat(), rows.length, rows[0].length, [], null);
+  }
+  function randInt(rng, lo, hi) { return lo + Math.floor(rng.random() * (hi - lo)); }
+
+  // Fit the frozen CfC encoder. `core`/`haz`: from fitCore/fitFirstCumHazard. rng: drives both
+  // encoderDataset's synthetic rollouts and every minibatch draw below -- one rng, one call,
+  // matching cumpredict.py's train_encoder(params, haz, rng).
+  async function trainEncoder(core, haz, rng, opts) {
+    opts = opts || {};
+    const iters = opts.iters || 1500;
+    const onProgress = opts.onProgress || null; // (step, iters, lastLoss) -> void, for a UI bar
+    const { hist, pol, y } = await encoderDataset(core, haz, rng, opts.datasetOpts);
+    const d0 = new Director(rng, core, null, null, null); // linear modality, matches Python's default
+    const descAll = descriptorsBatch(pol, d0.core, d0.rateRef);
+    const polN = pol.map((p) => p.map((v, i) => (v - POLICY_LO[i]) / POLICY_SPAN[i]));
+    const descN = descAll.map((row) => row.map((v, i) => (v - d0.dmin[i]) / d0.drange[i]));
+    const net = new CfcEnc(rng);
+    const opt = new Adam(net.params(), 2e-3);
+    const N = y.length, T_HIST = hist[0].length, NV = 300;
+
+    let lastLoss = null;
+    for (let step = 0; step < iters; step++) {
+      const idx = Array.from({ length: 256 }, () => randInt(rng, 0, N - NV));
+      const L = Array.from({ length: 256 }, () => randInt(rng, 0, T_HIST + 1));
+      const keepBatch = [];
+      for (let t = 0; t < T_HIST; t++) keepBatch.push(idx.map((_, b) => (t >= T_HIST - L[b] ? 1 : 0)));
+      const histBatch = gatherHistBatch(hist, idx, T_HIST);
+      const polB = gatherRowsBatch(polN, idx), descB = gatherRowsBatch(descN, idx), YB = gatherRowsBatch(y, idx);
+      opt.zeroGrad();
+      const out = net.forward(histBatch, polB, descB, keepBatch);
+      const loss = tMeanSquareDiff(out, YB);
+      backwardFrom(loss);
+      opt.step();
+      lastLoss = loss.data[0];
+      if (onProgress && (step % 50 === 0 || step === iters - 1)) onProgress(step, iters, lastLoss);
+      if (step % 10 === 0) await yieldToUI();
+    }
+
+    // Genuinely held out: the last NV samples never entered a minibatch above (idx is drawn from
+    // [0, N-NV)), scored at the same random-length-prefix masking live actually feeds.
+    const heldIdx = Array.from({ length: NV }, (_, i) => N - NV + i);
+    const jl = Array.from({ length: NV }, () => randInt(rng, 0, T_HIST + 1));
+    const jkBatch = [];
+    for (let t = 0; t < T_HIST; t++) jkBatch.push(jl.map((Lb) => (t >= T_HIST - Lb ? 1 : 0)));
+    const outHeld = net.forward(gatherHistBatch(hist, heldIdx, T_HIST), gatherRowsBatch(polN, heldIdx),
+                                gatherRowsBatch(descN, heldIdx), jkBatch);
+    const YHeld = gatherRowsBatch(y, heldIdx);
+    let peakMSE = 0, cycleMSE = 0;
+    for (let b = 0; b < NV; b++) {
+      const dp = outHeld.data[b * 2] - YHeld.data[b * 2], dc = outHeld.data[b * 2 + 1] - YHeld.data[b * 2 + 1];
+      peakMSE += dp * dp; cycleMSE += dc * dc;
+    }
+    peakMSE /= NV; cycleMSE /= NV;
+    const heldMSE = (peakMSE + cycleMSE) / 2;
+
+    // THE GATE. cfcFeatures is a second written copy of this net's forward pass (one runs at
+    // inference with no torch/autodiff at all, this one trains) -- checked here on the ROUNDED,
+    // exported weights, through the real cfcFeatures function, because that is what ships.
+    const ew = net.exportWeights();
+    const probe = { w: ew };
+    const last8 = Array.from({ length: 8 }, (_, i) => N - 8 + i);
+    const refOut = net.phi(gatherHistBatch(hist, last8, T_HIST), gatherRowsBatch(polN, last8), gatherRowsBatch(descN, last8), null);
+    let skew = 0;
+    for (let b = 0; b < 8; b++) {
+      const gotRow = cfcFeatures(probe, hist[last8[b]], [polN[last8[b]]], [descN[last8[b]]])[0];
+      for (let f = 0; f < NF_ENC; f++) skew = Math.max(skew, Math.abs(gotRow[f] - refOut.data[b * NF_ENC + f]));
+    }
+    const ENC_PARITY_TOL = 1e-3; // Python's 1e-4 assumes float32; this engine is float64 throughout
+    if (!(skew < ENC_PARITY_TOL))
+      throw new Error(`encoder NOT exported: cfcFeatures disagrees with the trained net by ${skew.toExponential(2)} (tolerance ${ENC_PARITY_TOL}). They are two written copies of one model and an edit landed on only one of them.`);
+
+    return { weights: ew, dmin: d0.dmin, drange: d0.drange, heldMSE, peakMSE, cycleMSE, skew, lastTrainLoss: lastLoss };
+  }
+
+  return {
+    CORE_NAMES, POLICY_NAMES, POLICY_BOUNDS, POLICY_LO, POLICY_HI, POLICY_SPAN, DESC_NAMES,
+    EASE_SPAN, BAND_MIN, REFRACTORY, PEAK_MAX, CUM_COST, TIMEOUT_COST, BIAS_LR, CUM_THR,
+    MAX_BUILD_S, MAX_EASE_S, VIB_RATE_REF, NF_ENC, NH_ENC, HIST_ENC, RECENT_CELLS, HROW, HROW_T,
+    NBIN, EPS_UNIFORM, NN_CAND,
+    softplus, CoreStreamer, settle, setpointsBatch, descriptorsBatch, lecun, matVec, cfcFeatures,
+    encBad, cholesky, RLS, outcome, histRow, cumHazard, RuntimeRNG, TestRNG, Director,
+    tensor, zerosTensor, paramFlat, backwardFrom, tAdd, tMul, tScale, tOneMinus, tTanh, tSigmoid,
+    tMulCol, tCol, tLinear, tConcat, tWhereCol, tMeanSquareDiff, CfcCell, CfcEnc, Adam,
+    interpOnRise, sessionFromRaw, parseCsvText, sessionFromFrame, loadSessionsFromCsvText,
+    replayedRows, trainingSessions, augmentRaw, cumOnsets,
+    CORE_BOUNDS, cem, fitCoreLoss, fitCore, fitFirstCumHazard, computeExtent, encoderDataset,
+    trainEncoder, yieldToUI,
+  };
+});
+/* ============================== end of inlined core.js ============================== */
+</script>
+<script>
+// Small hand-picked slice of the real Python's output, embedded directly (not the full dev-only
+// golden.json, which also carries ~470KB of encoder weights + RLS traces not needed just to prove
+// this page's math agrees with cumpredict.py). Full parity suite: repo's parity.js + golden.json.
+const REF = {
+  params: {"a":1.0,"b":0.2,"tauE":36.70404724860701,"g":10.0,"thr":0.3481986346168275,
+            "rho":0.019826726598916752,"lam":0.015000577156781684,"kH":0.13015650589671368,
+            "hH":0.0,"dH":0.01634911426805333},
+  trace3: [
+    {intensity:0.6270739405881613, dt:0.10547144236043096, A:6.505728777551206e-05, E:0.002821557264267671, H:0.0},
+    {intensity:0.5274470399599522, dt:2.0621019349433483, A:0.0016607488052338484, E:0.027600169336151913, H:0.0},
+    {intensity:0.9683778982143849, dt:0.662207005918026, A:0.002263847411659421, E:0.04590911269095367, H:0.0},
+  ],
+  sp0: {loA:0.09814745374146307, hiA:0.7191354892688842, tgt:0.43969087328154466, rls:0.18353330862648348},
+  desc0: [0.35, 0.13, 0.0875, 0.45, 0.43969087328154466, 95.52699492259018],
+};
+
+function logLine(msg) {
+  document.getElementById("log").textContent += "\n" + msg;
+}
+function clearLog(msg) {
+  document.getElementById("log").textContent = msg;
+}
+
+function runSelfCheck() {
+  const C = window.CumPredict;
+  const lines = [];
+  let pass = 0, fail = 0;
+  function check(name, actual, expected, eps) {
+    eps = eps === undefined ? 1e-9 : eps;
+    const d = Math.abs(actual - expected);
+    const ok = d <= eps;
+    ok ? pass++ : fail++;
+    lines.push(`${ok ? "PASS" : "FAIL"}  ${name}  got=${actual}  want=${expected}  diff=${d}`);
+  }
+
+  const cs = new C.CoreStreamer(REF.params, null);
+  REF.trace3.forEach((row, i) => {
+    const A = cs.step(row.intensity, row.dt);
+    check(`CoreStreamer.step[${i}] A`, A, row.A);
+    check(`CoreStreamer.step[${i}] E`, cs.E, row.E);
+  });
+
+  // POLICY_BOUNDS' own low corner -- reuse it rather than re-typing the same 8 numbers a second
+  // time, so this fixture can't quietly drift from the constant it's actually testing against.
+  const sp = C.setpointsBatch([C.POLICY_LO], REF.params, null);
+  check("setpoints loA", sp.loA[0], REF.sp0.loA);
+  check("setpoints hiA", sp.hiA[0], REF.sp0.hiA);
+  check("setpoints tgt", sp.tgt[0], REF.sp0.tgt);
+  check("setpoints rls", sp.rls[0], REF.sp0.rls);
+
+  const desc = C.descriptorsBatch([C.POLICY_LO], REF.params, null);
+  REF.desc0.forEach((v, i) => check(`descriptors[${i}]`, desc[0][i], v, 1e-6));
+
+  const out = document.getElementById("log");
+  out.innerHTML = lines.map((l) => {
+    const cls = l.startsWith("PASS") ? "pass" : "fail";
+    return `<span class="${cls}">${l}</span>`;
+  }).join("\n") + `\n\n${pass} passed, ${fail} failed -- ${fail === 0 ? "matches Python." : "MISMATCH, do not trust this build."}`;
+}
+
+document.getElementById("selfcheck").addEventListener("click", runSelfCheck);
+
+// ---- train-from-CSV panel: fitCore -> fitFirstCumHazard -> trainEncoder, all client-side ----
+async function sha1Hex10(text) {
+  const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 10);
+}
+
+let sessions = [];      // populated by either "use bundled data" or the file input, same shape either way
+let trainResult = null;
+let bundledModel = null, bundledEncoder = null; // from ./model.json + ./encoder.json, if fetch worked
+
+function setStatus(id, ok, text) {
+  const el = document.getElementById(id);
+  el.textContent = text; el.className = "v " + (ok ? "ok" : "no");
+}
+function refreshTrainBtn() {
+  document.getElementById("trainbtn").disabled = sessions.length === 0;
+}
+
+// Relative paths -- resolve against wherever THIS page is actually being loaded from, same rule
+// any <img src="./x.png"> follows. Locally that's this folder on disk; once this repo is public
+// on GitHub Pages, the exact same fetch("./model.json") call resolves to that repo's own file at
+// that point, with no code change needed. Never touches GitHub directly -- it can't, the repo is
+// private right now -- it only ever reads whatever server actually served this HTML.
+async function loadDefaults(auto) {
+  clearLog(`${auto ? "auto-loading" : "loading"} bundled model.json + encoder.json + sessions.csv (same directory as this page)...`);
+  try {
+    const [modelText, encoderText, csvText] = await Promise.all(
+      ["./model.json", "./encoder.json", "./sessions.csv"].map((p) =>
+        fetch(p).then((r) => { if (!r.ok) throw new Error(`${p}: HTTP ${r.status}`); return r.text(); }))
+    );
+    bundledModel = modelText; bundledEncoder = encoderText;
+    setStatus("st-model", true, "loaded");
+    setStatus("st-encoder", true, "loaded");
+    const C = window.CumPredict;
+    sessions = C.loadSessionsFromCsvText(csvText, "sessions", logLine);
+    setStatus("st-sessions", true, `${sessions.length} sessions`);
+    refreshTrainBtn();
+    logLine(`ready: ${sessions.map((s) => s.name).join(", ")}`);
+  } catch (err) {
+    // Most likely cause: this page was opened via file:// (double-clicked), where fetch() of
+    // local files is blocked by the browser's own CORS policy for that origin -- not a bug here,
+    // a browser security rule. Serve over http:// (e.g. `python -m http.server`) to fix it, or
+    // just use "upload your own CSV" instead, which reads the file directly with no fetch involved.
+    logLine(`could not auto-load: ${err.message}`);
+    logLine(`(if this page is open via file:// -- double-clicked, not http:// -- that's expected: ` +
+            `browsers block fetch() of local files from file:// pages. Either run e.g. ` +
+            `"python -m http.server" in this folder and open http://localhost:8000/cumpredict.html ` +
+            `instead, or just use "upload your own CSV" above, which doesn't need fetch() at all.)`);
+  }
+}
+document.getElementById("loadDefaults").addEventListener("click", () => loadDefaults(false));
+loadDefaults(true);
+
+document.getElementById("csvfiles").addEventListener("change", async (e) => {
+  const files = Array.from(e.target.files);
+  if (!files.length) return;
+  clearLog(`reading ${files.length} file(s)...`);
+  const C = window.CumPredict;
+  sessions = [];
+  for (const f of files) {
+    const text = await f.text();
+    sessions = sessions.concat(C.loadSessionsFromCsvText(text, f.name.replace(/\.csv$/i, ""), logLine));
+  }
+  setStatus("st-sessions", sessions.length > 0, sessions.length ? `${sessions.length} sessions` : "no sessions found");
+  refreshTrainBtn();
+  logLine(`loaded: ${sessions.map((s) => s.name).join(", ")}`);
+});
+
+document.getElementById("trainbtn").addEventListener("click", async () => {
+  const C = window.CumPredict;
+  const btn = document.getElementById("trainbtn"), progress = document.getElementById("trainprogress");
+  btn.disabled = true;
+  document.getElementById("exportbtn").style.display = "none";
+  clearLog("");
+  try {
+    const training = C.trainingSessions(sessions, logLine);
+    logLine(`${training.length} session(s) pass the training gates`);
+    if (!training.length) throw new Error("no trainable sessions -- every session had zero keypresses");
+
+    logLine("\nfitting predictor core (CEM -- this takes a while)...");
+    const rng = new C.RuntimeRNG();
+    const fitStart = Date.now();
+    const { core, loss } = await C.fitCore(training, rng, {
+      onProgress: (r, it, restarts, iters, bestLoss) => {
+        progress.textContent = `fitting core: restart ${r + 1}/${restarts}, iter ${it + 1}/${iters}, best loss ${bestLoss.toFixed(4)}`;
+      },
+    });
+    logLine(`core fit done in ${((Date.now() - fitStart) / 1000).toFixed(1)}s, loss=${loss.toFixed(4)}`);
+    logLine(JSON.stringify(core));
+
+    logLine("\nfitting first-cum hazard...");
+    const { h0, sharp } = C.fitFirstCumHazard(training, core);
+    logLine(`hazard: h0=${h0.toFixed(5)} sharp=${sharp.toFixed(1)}`);
+
+    logLine("\ntraining encoder (several minutes)...");
+    const trainStart = Date.now();
+    const result = await C.trainEncoder(core, [h0, sharp], rng, {
+      onProgress: (step, iters, lastLoss) => {
+        progress.textContent = `training encoder: step ${step}/${iters}, loss ${lastLoss.toFixed(5)}`;
+      },
+    });
+    logLine(`encoder trained in ${((Date.now() - trainStart) / 1000).toFixed(1)}s`);
+    logLine(`held-out MSE=${result.heldMSE.toFixed(6)} (peak ${result.peakMSE.toFixed(6)}, cycle ${result.cycleMSE.toFixed(6)})`);
+    logLine(`numpy/autodiff parity skew=${result.skew.toExponential(2)} (gate: must be < 1e-3)`);
+    progress.textContent = "done.";
+
+    const modelText = JSON.stringify({ core_names: C.CORE_NAMES, hazard: [h0, sharp], core_params: core });
+    const predictorHash = await sha1Hex10(modelText);
+    const encoderText = JSON.stringify({ predictor: predictorHash, w: result.weights, dmin: result.dmin, drange: result.drange });
+    trainResult = { modelText, encoderText };
+    document.getElementById("exportbtn").style.display = "";
+    logLine(`\npredictor hash: ${predictorHash}`);
+  } catch (err) {
+    logLine(`\nERROR: ${err.message}`);
+    progress.textContent = "failed.";
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("exportbtn").addEventListener("click", () => {
+  if (!trainResult) return;
+  for (const [name, text] of [["model.json", trainResult.modelText], ["encoder.json", trainResult.encoderText]]) {
+    const blob = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+});
+</script>
+<!--
+Self-test pattern -- no standalone *_parity.js/*.py files kept in this repo on purpose (this file
+is the only thing that ships; everything else was scaffolding). Regenerate on demand instead:
+
+1. Pull the core module out of this file and run it headless (no browser, no chrome-mcp):
+     node -e '
+       const fs=require("fs"), vm=require("vm");
+       const html=fs.readFileSync("cumpredict.html","utf8");
+       const script=[...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+       const sandbox={}; sandbox.self=sandbox; sandbox.window=sandbox;
+       vm.createContext(sandbox); vm.runInContext(script, sandbox);
+       const C = sandbox.CumPredict;
+       // call C.CoreStreamer / C.setpointsBatch / C.Director / C.fitCore / C.trainEncoder /
+       // C.loadSessionsFromCsvText(fs.readFileSync("sessions.csv","utf8"), "sessions") here
+     '
+   The UMD wrapper at the top of the core module takes the CommonJS branch under plain node
+   eval() (module is visible) but the true browser branch under vm.runInContext (module is not)
+   -- use vm, not eval, or CumPredict lands on module.exports instead of the sandbox global.
+
+2. To check a claim against real numbers rather than eyeballing it, generate reference values
+   from cumpredict.py's own functions (predict_core, stream_session, fit_core, cfc_features,
+   train_encoder, etc.) with a fixed seed and diff against the JS output above. This file no
+   longer exists in this repo (removed once the port was verified and complete) -- if it's ever
+   needed again, cumpredict.py's git history is preserved in the tagged v0.1-v0.4 commits, or in
+   the gist this project publishes from (see README.md).
+
+3. TestRNG (mulberry32 + Box-Muller) is exported from the core module specifically so a shared
+   deterministic stream can drive BOTH a JS Director/RLS/CEM run and a hand-written Python
+   mirror of the same RNG, giving byte-exact end-to-end replay instead of only checking pure
+   functions in isolation -- see how Director/_draw/RLS.sample consume rng.random()/
+   .uniform()/.uniformBatch()/.standardNormal() if reconstructing this.
+
+Verified this way before cumpredict.py was removed: 370/370 checks (predictor core, setpoints/
+descriptors, CfC encoder inference, RLS, Director/Thompson policy end-to-end, session data
+loading incl. a real injected duplicate-block detection, CEM core fitting, hazard fitting,
+encoder training with every gradient checked against real PyTorch .backward() to ~1e-8), plus a
+full run against all 13 real sessions end to end (fit -> hazard -> train), whose output is what
+model.json/encoder.json in this repo actually are.
+-->
+</body>
+</html>
