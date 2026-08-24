@@ -69,6 +69,7 @@
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: .6rem .7rem; font: inherit; font-size: .82rem; flex: 1 1 160px; min-width: 140px;
   }
+  .ortext { color: var(--text-dim); font-size: .8rem; align-self: center; flex: 0 0 auto; }
   .devicelabel { display: flex; align-items: center; gap: .6rem; font-size: .78rem; color: var(--text-dim); }
   .testicon { flex: 0 0 auto; padding: .3rem .6rem; font-size: .72rem; font-weight: 400; }
 
@@ -125,10 +126,12 @@
     <div class="runblock">
       <button id="runbtn" class="primary" disabled title="connect a device first">run</button>
       <div class="runchecks">
-        <label class="checkrow tiny" title="refits predictor+hazard+encoder from sessions.csv and your recorded data -- slow (5-20 min), skipped by default"><input type="checkbox" id="trainPredictor"> train predictor</label>
-        <label class="checkrow tiny" title="the prediction feeds itself as the label; nothing is recorded"><input type="checkbox" id="autoMode"> auto</label>
+        <label class="checkrow tiny" title="the prediction feeds itself as the label; nothing is recorded"><input type="checkbox" id="autoMode"> no training label, trust the Predictor</label>
       </div>
     </div>
+  </div>
+  <div class="bar" id="trainRow" style="display:none">
+    <button id="trainPredictorBtn" title="refits predictor+hazard+encoder from sessions.csv and your recorded data -- slow (5-20 min), no device needed">train predictor</button>
   </div>
   <div class="chiprow" id="chiprow">
     <span class="chip empty" id="chip-sessions"><span class="label">sessions.csv</span><button class="x" title="clear">&times;</button></span>
@@ -139,10 +142,14 @@
   <p>Predictor + CfC encoder + RLS/Thompson policy + training.</p>
 </header>
 
+<input type="file" id="modelfile" accept=".json" hidden>
+<input type="file" id="encoderfile" accept=".json" hidden>
+
 <section class="livepanel">
   <div class="bar">
     <button id="liveConnectIntiface">connect via Intiface</button>
     <input type="text" id="liveIntifaceUrl" class="urlinput" placeholder="ws://127.0.0.1:12345" value="ws://127.0.0.1:12345">
+    <span class="ortext" id="connectOrText">or</span>
     <button id="liveConnectBluetooth" title="loads a ~7MB WASM Bluetooth server on first use (not until you click this); Chrome/Edge/Opera only, HTTPS required">connect via Bluetooth</button>
     <button id="liveDisconnect" style="display:none">disconnect</button>
   </div>
@@ -1579,6 +1586,37 @@ async function loadDefaults() {
   }
 }
 
+// "train predictor" only earns its place on screen when there's actually something new to train
+// on -- the bundled sessions.csv alone is nothing a retrain would improve on. Re-checked at every
+// point either source of new data can change.
+let hasUploadedCsv = false, hasLiveCacheRows = false;
+function refreshTrainRow() {
+  document.getElementById("trainRow").style.display = (hasUploadedCsv || hasLiveCacheRows) ? "" : "none";
+}
+
+// Whatever model is "active" (bundled / freshly trained / uploaded by someone else) persists to
+// IndexedDB so it survives a reload -- his ask: keep the last trained weights around, and let
+// people share a model.json+encoder.json pair the same way they'd share a save file ("I trained on
+// my own data, try mine"). label is just what the chip shows: "trained" vs "loaded".
+async function setActiveModel(modelText, encoderText, label) {
+  bundledModel = modelText; bundledEncoder = encoderText;
+  setChip("model", `model.json (${label})`, "model.json");
+  setChip("encoder", `encoder.json (${label})`, "encoder.json");
+  refreshRunBtn();
+  liveDb = liveDb || await idbOpen();
+  await idbSetMeta(liveDb, "activeModel", modelText);
+  await idbSetMeta(liveDb, "activeEncoder", encoderText);
+}
+async function restoreActiveModelFromCache() {
+  liveDb = liveDb || await idbOpen();
+  const [m, e] = await Promise.all([idbGetMeta(liveDb, "activeModel"), idbGetMeta(liveDb, "activeEncoder")]);
+  if (!m || !e) return;
+  bundledModel = m; bundledEncoder = e;
+  setChip("model", "model.json (cached)", "model.json");
+  setChip("encoder", "encoder.json (cached)", "encoder.json");
+  logLine("restored your last trained/loaded model from browser storage");
+}
+
 document.getElementById("csvfiles").addEventListener("change", async (e) => {
   const files = Array.from(e.target.files);
   if (!files.length) return;
@@ -1587,12 +1625,16 @@ document.getElementById("csvfiles").addEventListener("change", async (e) => {
   for (const f of files) sessions = sessions.concat(await loadSessionsFile(f));
   setChip("sessions", sessions.length ? `${files.map((f) => f.name).join(", ")} (${sessions.length})` : null, "sessions.csv");
   logLine(`loaded: ${sessions.map((s) => s.name).join(", ")}`);
+  hasUploadedCsv = sessions.some((s) => !/^(?:VIB_)?live\d+$/.test(s.name));
+  refreshTrainRow();
 });
 
 document.getElementById("chip-sessions").querySelector(".x").addEventListener("click", () => {
   sessions = sessions.filter((s) => /^(?:VIB_)?live\d+$/.test(s.name)); // live cache stays; it's not a file upload
   setChip("sessions", null, "sessions.csv");
   logLine("sessions.csv cleared -- upload your own to train.");
+  hasUploadedCsv = false;
+  refreshTrainRow();
 });
 document.getElementById("chip-model").querySelector(".x").addEventListener("click", () => {
   bundledModel = null; setChip("model", null, "model.json"); refreshRunBtn();
@@ -1602,6 +1644,24 @@ document.getElementById("chip-encoder").querySelector(".x").addEventListener("cl
 });
 document.getElementById("chip-sessions").querySelector(".label").addEventListener("click", () => {
   if (document.getElementById("chip-sessions").classList.contains("empty")) document.getElementById("csvfiles").click();
+});
+document.getElementById("chip-model").querySelector(".label").addEventListener("click", () => {
+  if (document.getElementById("chip-model").classList.contains("empty")) document.getElementById("modelfile").click();
+});
+document.getElementById("chip-encoder").querySelector(".label").addEventListener("click", () => {
+  if (document.getElementById("chip-encoder").classList.contains("empty")) document.getElementById("encoderfile").click();
+});
+document.getElementById("modelfile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  await setActiveModel(await f.text(), bundledEncoder, "loaded");
+  logLine(`loaded ${f.name} as the active model.json`);
+});
+document.getElementById("encoderfile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  await setActiveModel(bundledModel, await f.text(), "loaded");
+  logLine(`loaded ${f.name} as the active encoder.json`);
 });
 
 // ---- live session: numpad keyboard capture ----
@@ -1838,6 +1898,8 @@ async function loadLiveCacheIntoSessions() {
   liveDb = liveDb || await idbOpen();
   sessions = sessions.filter((s) => !/^(?:VIB_)?live\d+$/.test(s.name));
   const rows = await idbGetAllRows(liveDb);
+  hasLiveCacheRows = rows.length > 0;
+  refreshTrainRow();
   if (!rows.length) { setChip("livecache", null, "live cache"); return; }
   const bySession = new Set(rows.map((r) => r.session));
   const lines = ["session,time_elapse,intensity,tired_level"];
@@ -2114,6 +2176,7 @@ function refreshRunBtn() {
 
 async function liveConnectClick(kind) {
   const ibtn = document.getElementById("liveConnectIntiface"), bbtn = document.getElementById("liveConnectBluetooth");
+  const orText = document.getElementById("connectOrText");
   if (typeof buttplug === "undefined") { logLine("ERROR: buttplug-js failed to load from the CDN (offline?) -- device connection isn't available."); return; }
   ibtn.disabled = bbtn.disabled = true;
   try {
@@ -2123,7 +2186,7 @@ async function liveConnectClick(kind) {
     document.getElementById("liveDeviceLabelText").textContent = `${bp.devKey} -- ${bp.isVib ? "vibration" : "linear"}`;
     document.getElementById("liveDeviceLabel").style.display = "";
     document.getElementById("liveDisconnect").style.display = "";
-    ibtn.style.display = "none"; bbtn.style.display = "none";
+    ibtn.style.display = "none"; bbtn.style.display = "none"; orText.style.display = "none";
     document.getElementById("liveIntifaceUrl").style.display = "none";
     await bpPark();
     refreshRunBtn();
@@ -2143,6 +2206,7 @@ document.getElementById("liveDisconnect").addEventListener("click", async () => 
   document.getElementById("liveIntifaceUrl").style.display = "";
   const ibtn = document.getElementById("liveConnectIntiface"), bbtn = document.getElementById("liveConnectBluetooth");
   ibtn.disabled = bbtn.disabled = false; ibtn.style.display = ""; bbtn.style.display = "";
+  document.getElementById("connectOrText").style.display = "";
   logLine("disconnected");
   refreshRunBtn();
 });
@@ -2156,6 +2220,7 @@ document.getElementById("liveTestToggle").addEventListener("click", async () => 
   liveActive = "test";
   btn.textContent = "stop";
   document.getElementById("runbtn").disabled = true;
+  document.getElementById("trainPredictorBtn").disabled = true;
   const signal = liveCancelToken = { cancelled: false };
   liveStreamer = new C.CoreStreamer(JSON.parse(bundledModel).core_params, null);
   liveDirector = null;
@@ -2163,94 +2228,112 @@ document.getElementById("liveTestToggle").addEventListener("click", async () => 
   catch (err) { logLine(`\nERROR: ${err.message}`); }
   finally {
     btn.textContent = "test";
+    document.getElementById("trainPredictorBtn").disabled = false;
     liveActive = null; liveCancelToken = null;
     refreshRunBtn();
   }
 });
 
-// "run": the one entry point. Unchecked boxes (default) = go straight to a LABEL session with
-// whatever model is already loaded. "train predictor" first re-fits predictor+hazard+encoder from
-// sessions (bundled + any browser-cached live data) and uses the fresh result. "auto" swaps the
-// live session itself from label to auto. This one button + its two checkboxes replaces what used
-// to be a separate "train" button entirely -- nobody wants to wait 5-20 minutes just to go live.
+// "run": go live with whatever model is currently active (bundled / trained / loaded from a file).
+// Needs a connected device; does NOT train -- that's its own button below, since training needs
+// data, not a toy, and shouldn't make anyone sit through a device-connect ceremony first.
 document.getElementById("runbtn").addEventListener("click", async () => {
   const C = window.CumPredict;
   const btn = document.getElementById("runbtn");
   if (liveActive === "run") { if (liveCancelToken) { liveCancelToken.cancelled = true; logLine("\nstopping..."); } return; }
   if (liveActive) return;
+  if (!bundledModel || !bundledEncoder) { logLine('ERROR: no model.json/encoder.json loaded -- train one below or reload the page.'); return; }
 
-  const wantTrain = document.getElementById("trainPredictor").checked;
   const mode = document.getElementById("autoMode").checked ? "auto" : "label";
-  const progress = document.getElementById("trainprogress");
   liveDb = liveDb || await idbOpen();
   clearLog("");
   liveActive = "run";
   btn.textContent = "stop"; btn.classList.remove("primary"); btn.classList.add("stopbtn");
-  document.getElementById("trainPredictor").disabled = true;
   document.getElementById("autoMode").disabled = true;
   document.getElementById("liveTestToggle").disabled = true;
+  document.getElementById("trainPredictorBtn").disabled = true;
   const signal = liveCancelToken = { cancelled: false };
   try {
-    let coreParams, encoderObj;
-    if (wantTrain) {
-      const training = C.trainingSessions(sessions, logLine);
-      logLine(`${training.length} session(s) pass the training gates`);
-      if (!training.length) throw new Error("no trainable sessions -- every session had zero keypresses");
-      const rng = new C.RuntimeRNG();
-      logLine("\nfitting predictor core (CEM -- this takes a while)...");
-      const fitStart = Date.now();
-      const { core, loss } = await C.fitCore(training, rng, {
-        signal,
-        onProgress: (r, it, restarts, iters, bestLoss) => {
-          progress.textContent = `fitting core: restart ${r + 1}/${restarts}, iter ${it + 1}/${iters}, best loss ${bestLoss.toFixed(4)}`;
-        },
-      });
-      logLine(`core fit done in ${((Date.now() - fitStart) / 1000).toFixed(1)}s, loss=${loss.toFixed(4)}`);
-      logLine("\nfitting first-cum hazard...");
-      const { h0, sharp } = C.fitFirstCumHazard(training, core);
-      logLine(`hazard: h0=${h0.toFixed(5)} sharp=${sharp.toFixed(1)}`);
-      logLine("\ntraining encoder (several minutes)...");
-      const trainStart = Date.now();
-      const result = await C.trainEncoder(core, [h0, sharp], rng, {
-        signal,
-        onProgress: (step, iters, lastLoss) => {
-          progress.textContent = `training encoder: step ${step}/${iters}, loss ${lastLoss.toFixed(5)}`;
-        },
-      });
-      logLine(`encoder trained in ${((Date.now() - trainStart) / 1000).toFixed(1)}s, held-out MSE=${result.heldMSE.toFixed(6)}`);
-      logLine(`numpy/autodiff parity skew=${result.skew.toExponential(2)} (gate: must be < 1e-3)`);
-      const modelText = JSON.stringify({ core_names: C.CORE_NAMES, hazard: [h0, sharp], core_params: core });
-      const predictorHash = await sha1Hex10(modelText);
-      const encoderText = JSON.stringify({ predictor: predictorHash, w: result.weights, dmin: result.dmin, drange: result.drange });
-      trainResult = { modelText, encoderText };
-      bundledModel = modelText; bundledEncoder = encoderText;
-      setChip("model", "model.json (trained)", "model.json");
-      setChip("encoder", "encoder.json (trained)", "encoder.json");
-      document.getElementById("exportRow").style.display = "";
-      logLine(`predictor hash: ${predictorHash}`);
-      coreParams = core; encoderObj = JSON.parse(encoderText);
-    } else {
-      if (!bundledModel || !bundledEncoder) throw new Error('no model.json/encoder.json loaded -- check "train predictor" or reload the page');
-      coreParams = JSON.parse(bundledModel).core_params;
-      encoderObj = JSON.parse(bundledEncoder);
-    }
-    if (signal.cancelled) throw new C.CancelledError();
-    progress.textContent = "";
+    const coreParams = JSON.parse(bundledModel).core_params;
+    const encoderObj = JSON.parse(bundledEncoder);
     liveModelHash = encoderObj.predictor;
     liveStreamer = new C.CoreStreamer(coreParams, null);
     const prior = mode === "label" ? await idbGetMeta(liveDb, "policy") : null;
     liveDirector = new C.Director(new C.RuntimeRNG(), coreParams, prior, encoderObj);
     await liveMainLoop(mode, signal);
   } catch (err) {
+    if (err instanceof C.CancelledError) logLine("\ncancelled.");
+    else logLine(`\nERROR: ${err.message}`);
+  } finally {
+    btn.textContent = "run"; btn.classList.add("primary"); btn.classList.remove("stopbtn");
+    document.getElementById("autoMode").disabled = false;
+    document.getElementById("liveTestToggle").disabled = false;
+    document.getElementById("trainPredictorBtn").disabled = false;
+    liveActive = null; liveCancelToken = null;
+    refreshRunBtn();
+  }
+});
+
+// "train predictor": independent of "run" and of any device -- refits predictor+hazard+encoder
+// from sessions (bundled + your uploaded CSV + any browser-cached live data), slow (5-20 min), only
+// shown once there's actually new data (see refreshTrainRow). The result becomes the active model
+// via setActiveModel, which also persists it to IndexedDB and is what a later "run" click will use.
+document.getElementById("trainPredictorBtn").addEventListener("click", async () => {
+  const C = window.CumPredict;
+  const btn = document.getElementById("trainPredictorBtn");
+  if (liveActive === "train") { if (liveCancelToken) { liveCancelToken.cancelled = true; logLine("\nstopping..."); } return; }
+  if (liveActive) return;
+
+  const progress = document.getElementById("trainprogress");
+  clearLog("");
+  liveActive = "train";
+  btn.textContent = "stop";
+  document.getElementById("runbtn").disabled = true;
+  document.getElementById("liveTestToggle").disabled = true;
+  const signal = liveCancelToken = { cancelled: false };
+  try {
+    const training = C.trainingSessions(sessions, logLine);
+    logLine(`${training.length} session(s) pass the training gates`);
+    if (!training.length) throw new Error("no trainable sessions -- every session had zero keypresses");
+    const rng = new C.RuntimeRNG();
+    logLine("\nfitting predictor core (CEM -- this takes a while)...");
+    const fitStart = Date.now();
+    const { core, loss } = await C.fitCore(training, rng, {
+      signal,
+      onProgress: (r, it, restarts, iters, bestLoss) => {
+        progress.textContent = `fitting core: restart ${r + 1}/${restarts}, iter ${it + 1}/${iters}, best loss ${bestLoss.toFixed(4)}`;
+      },
+    });
+    logLine(`core fit done in ${((Date.now() - fitStart) / 1000).toFixed(1)}s, loss=${loss.toFixed(4)}`);
+    logLine("\nfitting first-cum hazard...");
+    const { h0, sharp } = C.fitFirstCumHazard(training, core);
+    logLine(`hazard: h0=${h0.toFixed(5)} sharp=${sharp.toFixed(1)}`);
+    logLine("\ntraining encoder (several minutes)...");
+    const trainStart = Date.now();
+    const result = await C.trainEncoder(core, [h0, sharp], rng, {
+      signal,
+      onProgress: (step, iters, lastLoss) => {
+        progress.textContent = `training encoder: step ${step}/${iters}, loss ${lastLoss.toFixed(5)}`;
+      },
+    });
+    logLine(`encoder trained in ${((Date.now() - trainStart) / 1000).toFixed(1)}s, held-out MSE=${result.heldMSE.toFixed(6)}`);
+    logLine(`numpy/autodiff parity skew=${result.skew.toExponential(2)} (gate: must be < 1e-3)`);
+    const modelText = JSON.stringify({ core_names: C.CORE_NAMES, hazard: [h0, sharp], core_params: core });
+    const predictorHash = await sha1Hex10(modelText);
+    const encoderText = JSON.stringify({ predictor: predictorHash, w: result.weights, dmin: result.dmin, drange: result.drange });
+    trainResult = { modelText, encoderText };
+    await setActiveModel(modelText, encoderText, "trained");
+    document.getElementById("exportRow").style.display = "";
+    logLine(`predictor hash: ${predictorHash}`);
+    progress.textContent = "done.";
+  } catch (err) {
     if (err instanceof C.CancelledError) { logLine("\ncancelled."); progress.textContent = "cancelled."; }
     else { logLine(`\nERROR: ${err.message}`); progress.textContent = "failed."; }
   } finally {
-    btn.textContent = "run"; btn.classList.add("primary"); btn.classList.remove("stopbtn");
-    document.getElementById("trainPredictor").disabled = false;
-    document.getElementById("autoMode").disabled = false;
+    btn.textContent = "train predictor";
+    document.getElementById("runbtn").disabled = !bp.device;
     document.getElementById("liveTestToggle").disabled = false;
     liveActive = null; liveCancelToken = null;
-    refreshRunBtn();
   }
 });
 
@@ -2266,7 +2349,7 @@ document.getElementById("exportbtn").addEventListener("click", () => {
   }
 });
 
-loadDefaults().then(loadLiveCacheIntoSessions);
+loadDefaults().then(loadLiveCacheIntoSessions).then(restoreActiveModelFromCache);
 refreshRunBtn();
 </script>
 <!--
