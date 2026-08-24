@@ -6,8 +6,11 @@
 <title>cumpredict</title>
 <!-- Device I/O only -- the predictor/encoder/RLS/Director core above never depends on this load
      succeeding, so a blocked CDN (offline use) still leaves training and inference fully working;
-     only the "connect" buttons in the live panel need window.Buttplug to exist. -->
-<script src="https://cdn.jsdelivr.net/npm/buttplug@0.12.2/dist/web/buttplug.min.js"></script>
+     only the "connect" button in the live panel needs window.buttplug to exist. Pinned to an exact
+     version deliberately (not a floating "@5") -- check npmjs.com/package/buttplug occasionally
+     for a newer one; this project already got bitten once by a version nobody had re-checked in
+     years (see the repo history around 2026-08-24). -->
+<script src="https://cdn.jsdelivr.net/npm/buttplug@5.0.1/dist/web/buttplug.js"></script>
 <style>
   :root {
     color-scheme: dark;
@@ -140,7 +143,7 @@
   <div class="bar">
     <button id="liveConnectIntiface">connect via Intiface</button>
     <input type="text" id="liveIntifaceUrl" class="urlinput" placeholder="ws://127.0.0.1:12345" value="ws://127.0.0.1:12345">
-    <button id="liveConnectBluetooth">connect via Bluetooth</button>
+    <button id="liveConnectBluetooth" disabled title="not currently available -- buttplug-js dropped its direct-Bluetooth connector; only the Intiface Central/Engine relay works right now">connect via Bluetooth</button>
     <button id="liveDisconnect" style="display:none">disconnect</button>
   </div>
   <div id="liveDeviceLabel" class="devicelabel" style="display:none">
@@ -1633,10 +1636,22 @@ function liveDrainPresses() { return livePressQ.splice(0); }
 // ten digit words matter, so this uses the plain built-in SpeechRecognition with no grammar/NLU --
 // homophones ("to"/"too"/"for") are deliberately NOT mapped, since they're common words that would
 // false-trigger off ordinary speech or moaning during a session; the ten canonical number words
-// plus bare numerals (Chrome often transcribes "nine" as literal "9") are the whole vocabulary. ----
-const VOICE_WORD_TO_LEVEL = {
-  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+// plus bare numerals (Chrome often transcribes "nine" as literal "9") are the whole vocabulary.
+// Not every language, just the browser's own (auto-detected from navigator.language, no picker to
+// build or explain) among the handful most common on the web -- unrecognized languages fall back
+// to English rather than silently doing nothing. ----
+const VOICE_WORDS_BY_LANG = {
+  en: { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 },
+  es: { cero: 0, uno: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6, siete: 7, ocho: 8, nueve: 9 },
+  fr: { zéro: 0, un: 1, deux: 2, trois: 3, quatre: 4, cinq: 5, six: 6, sept: 7, huit: 8, neuf: 9 },
+  de: { null: 0, eins: 1, zwei: 2, drei: 3, vier: 4, fünf: 5, sechs: 6, sieben: 7, acht: 8, neun: 9 },
+  pt: { zero: 0, um: 1, dois: 2, três: 3, quatro: 4, cinco: 5, seis: 6, sete: 7, oito: 8, nove: 9 },
+  it: { zero: 0, uno: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9 },
+  zh: { "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9 },
 };
+const VOICE_RECOG_LANG = { en: "en-US", es: "es-ES", fr: "fr-FR", de: "de-DE", pt: "pt-PT", it: "it-IT", zh: "zh-CN" };
+const voiceLangKey = VOICE_WORDS_BY_LANG[(navigator.language || "en").slice(0, 2).toLowerCase()] ? (navigator.language || "en").slice(0, 2).toLowerCase() : "en";
+const VOICE_WORD_TO_LEVEL = VOICE_WORDS_BY_LANG[voiceLangKey];
 const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
 let voiceRecognition = null, voiceActive = false;
 
@@ -1663,7 +1678,7 @@ function fadeVoiceIcon(emoji, holdMs) {
 
 function startVoice() {
   voiceRecognition = new SpeechRecognitionCtor();
-  voiceRecognition.lang = "en-US";
+  voiceRecognition.lang = VOICE_RECOG_LANG[voiceLangKey];
   voiceRecognition.continuous = true;
   voiceRecognition.interimResults = false;
   voiceRecognition.onresult = (e) => {
@@ -1716,7 +1731,31 @@ document.getElementById("labelSlider").addEventListener("change", (e) => {
   pushPress(Number(e.target.value) / 9.0);
 });
 
-function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+// Dedicated Worker for sleepMs -- a backgrounded/unfocused tab throttles the MAIN thread's
+// setTimeout to roughly once a second in most browsers, which would stretch a 130ms stroke's
+// movement-wait loop into multi-second steps and badly distort a live session's pacing while
+// tabbed away (the requirement is to keep running at normal pace in the background, not just
+// avoid crashing -- switching tabs to read something else shouldn't slow the session down).
+// Dedicated Workers are not subject to that same throttling, so routing every wait through one
+// fixes it everywhere at once, since all pacing already goes through this single function.
+// Inlined via a Blob URL so this stays one self-contained file, no separate .js to ship.
+const sleepWorker = new Worker(URL.createObjectURL(new Blob(
+  ["onmessage = (e) => setTimeout(() => postMessage(e.data), e.data.ms);"],
+  { type: "application/javascript" }
+)));
+let sleepReqId = 0;
+const sleepPending = new Map();
+sleepWorker.onmessage = (e) => {
+  const resolve = sleepPending.get(e.data.id);
+  if (resolve) { sleepPending.delete(e.data.id); resolve(); }
+};
+function sleepMs(ms) {
+  return new Promise((resolve) => {
+    const id = sleepReqId++;
+    sleepPending.set(id, resolve);
+    sleepWorker.postMessage({ id, ms });
+  });
+}
 function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("device command timed out")), ms);
@@ -1816,13 +1855,21 @@ document.getElementById("chip-livecache").querySelector(".x").addEventListener("
   logLine("live cache cleared from browser storage.");
 });
 
-// ---- live session: device connection (buttplug-js) ----
+// ---- live session: device connection (buttplug-js@5, Buttplug Spec v3 -- verified 2026-08-24
+// against the actual published source, not assumed from an older example. Method names are
+// lowercase (connect/disconnect/startScanning/stopScanning), devices come back as a Map keyed by
+// index (not an array), and per-message methods (SendLinearCmd etc.) are gone in favor of a
+// unified device.hasOutput(type)/device.runOutput(cmd) pair -- see buttplug.OutputType /
+// buttplug.DeviceOutput. Current gap, not silently worked around: this library no longer ships a
+// direct/embedded Bluetooth connector at all (only the Intiface Central/Engine websocket relay),
+// so "connect via Bluetooth" isn't available until that's resolved -- see the chat, not this
+// comment, for the decision on what to do about it. ----
 const OUTAGE_CENSOR_S = 20.0, PARK_S = 0.5;
 let bp = { client: null, device: null, devKey: null, isVib: false, lastPos: null, up: false, kind: null, intifaceUrl: null };
 
 function bpCaps(dev) {
-  const am = dev.AllowedMessages || [];
-  return { linear: am.includes("LinearCmd"), vibrate: am.includes("VibrateCmd"), rotate: am.includes("RotateCmd") };
+  const T = buttplug.OutputType;
+  return { linear: dev.hasOutput(T.HwPositionWithDuration), vibrate: dev.hasOutput(T.Vibrate), rotate: dev.hasOutput(T.Rotate) };
 }
 
 // Same identity rule as cumpredict.py's key_of/attach_device: the toy already running is the
@@ -1830,47 +1877,46 @@ function bpCaps(dev) {
 // whatever's there. Modality is only RE-DERIVED on the first attach of a given device name --
 // trusting a reconnect's own capability read over the session's already-established modality,
 // because that read can be a still-settling BLE service-discovery race, not a different toy.
-function bpPickDevice(devices) {
-  if (!devices.length) throw new Error("no device found -- is Intiface running / did you pair over Bluetooth?");
-  const same = devices.find((d) => d.Name === bp.devKey);
+function bpPickDevice(devicesMap) {
+  const devices = Array.from(devicesMap.values());
+  if (!devices.length) throw new Error("no device found -- is Intiface running?");
+  const same = devices.find((d) => d.name === bp.devKey);
   const linear = devices.find((d) => bpCaps(d).linear);
   const dev = same || linear || devices[0];
   const caps = bpCaps(dev);
   if (!caps.linear && !caps.vibrate && !caps.rotate)
-    throw new Error(`'${dev.Name}' exposes no actuator this page can drive`);
+    throw new Error(`'${dev.name}' exposes no actuator this page can drive`);
   return dev;
 }
 function bpAttach(dev) {
   const caps = bpCaps(dev);
-  if (bp.devKey === null || dev.Name !== bp.devKey) bp.isVib = !caps.linear && (caps.vibrate || caps.rotate);
-  const changed = bp.devKey !== null && dev.Name !== bp.devKey;
-  bp.device = dev; bp.devKey = dev.Name; bp.lastPos = null;
+  if (bp.devKey === null || dev.name !== bp.devKey) bp.isVib = !caps.linear && (caps.vibrate || caps.rotate);
+  const changed = bp.devKey !== null && dev.name !== bp.devKey;
+  bp.device = dev; bp.devKey = dev.name; bp.lastPos = null;
   return changed;
 }
 
 async function bpConnect(kind, intifaceUrl) {
-  const client = new Buttplug.ButtplugClient("cumpredict");
-  const connector = kind === "intiface"
-    ? new Buttplug.ButtplugBrowserWebsocketClientConnector(intifaceUrl)
-    : new Buttplug.ButtplugEmbeddedClientConnector();
-  await client.Connect(connector);
+  const client = new buttplug.ButtplugClient("cumpredict");
+  const connector = new buttplug.ButtplugBrowserWebsocketClientConnector(intifaceUrl);
+  await client.connect(connector);
   logLine(`connected (${kind}); scanning -- power the toy on now (up to 90s)`);
-  await client.StartScanning();
+  await client.startScanning();
   const t0 = performance.now();
-  while (performance.now() - t0 < 90000 && client.Devices.length === 0) await sleepMs(2000);
-  await client.StopScanning();
-  const dev = bpPickDevice(client.Devices);
+  while (performance.now() - t0 < 90000 && client.devices.size === 0) await sleepMs(2000);
+  await client.stopScanning();
+  const dev = bpPickDevice(client.devices);
   const changed = bpAttach(dev);
   bp.client = client; bp.kind = kind; bp.intifaceUrl = intifaceUrl;
   const caps = bpCaps(dev);
   const capList = ["linear", "vibrate", "rotate"].filter((k) => caps[k]).join(", ") || "none";
-  logLine(`device: ${dev.Name} [${capList}] -- modality: ${bp.isVib ? "VIBRATION (uncalibrated, trust your presses)" : "LINEAR"}`);
+  logLine(`device: ${dev.name} [${capList}] -- modality: ${bp.isVib ? "VIBRATION (uncalibrated, trust your presses)" : "LINEAR"}`);
   return changed;
 }
 
 async function bpReconnect() {
   logLine("connection lost -- reconnecting...");
-  if (bp.client) { try { await bp.client.Disconnect(); } catch (e) {} }
+  if (bp.client) { try { await bp.client.disconnect(); } catch (e) {} }
   const changed = await bpConnect(bp.kind, bp.intifaceUrl);
   await bpPark();
   return changed;
@@ -1879,17 +1925,17 @@ async function bpReconnect() {
 // One retry, same as cumpredict.py's drive(): a single slow command must not cost the session,
 // but a device that's genuinely gone should surface within a couple seconds, not hang the loop.
 async function bpDrive(lo, hi, dur) {
-  const dev = bp.device, caps = bpCaps(dev);
+  const dev = bp.device, caps = bpCaps(dev), D = buttplug.DeviceOutput;
   for (const attempt of [1, 2]) {
     try {
       if (caps.linear) {
         const tgt = bp.up ? hi : lo;
-        await withTimeout(dev.SendLinearCmd(tgt, Math.round(Math.max(dur, 0.05) * 1000)), Math.max(1000, dur * 1000));
+        await withTimeout(dev.runOutput(D.PositionWithDuration.percent(tgt, Math.round(Math.max(dur, 0.05) * 1000))), Math.max(1000, dur * 1000));
         bp.up = !bp.up;
         return tgt;
       }
-      if (caps.vibrate) { await withTimeout(dev.SendVibrateCmd(hi), 5000); return hi; }
-      if (caps.rotate) { await withTimeout(dev.SendRotateCmd(hi, true), 5000); return hi; }
+      if (caps.vibrate) { await withTimeout(dev.runOutput(D.Vibrate.percent(hi)), 5000); return hi; }
+      if (caps.rotate) { await withTimeout(dev.runOutput(D.Rotate.percent(hi)), 5000); return hi; }
       return null;
     } catch (err) {
       logLine(`CMD ERROR (${attempt}/2) ${err.message}`);
@@ -2041,7 +2087,7 @@ async function liveMainLoop(mode, signal) {
     } else if (mode === "auto") {
       logLine("auto: nothing recorded, policy memory left as it was");
     }
-    if (bp.device) { try { await bp.device.SendStopDeviceCmd(); } catch (e) {} }
+    if (bp.device) { try { await bp.device.stop(); } catch (e) {} }
   }
 }
 
@@ -2055,8 +2101,8 @@ function refreshRunBtn() {
 
 async function liveConnectClick(kind) {
   const ibtn = document.getElementById("liveConnectIntiface"), bbtn = document.getElementById("liveConnectBluetooth");
-  if (typeof Buttplug === "undefined") { logLine("ERROR: buttplug-js failed to load from the CDN (offline?) -- device connection isn't available."); return; }
-  ibtn.disabled = bbtn.disabled = true;
+  if (typeof buttplug === "undefined") { logLine("ERROR: buttplug-js failed to load from the CDN (offline?) -- device connection isn't available."); return; }
+  ibtn.disabled = true;
   try {
     const url = document.getElementById("liveIntifaceUrl").value.trim() || "ws://127.0.0.1:12345";
     await bpConnect(kind, url);
@@ -2069,20 +2115,19 @@ async function liveConnectClick(kind) {
     refreshRunBtn();
   } catch (err) {
     logLine(`connect failed: ${err.message}`);
-    ibtn.disabled = bbtn.disabled = false;
+    ibtn.disabled = false;
   }
 }
 document.getElementById("liveConnectIntiface").addEventListener("click", () => liveConnectClick("intiface"));
-document.getElementById("liveConnectBluetooth").addEventListener("click", () => liveConnectClick("bluetooth"));
 
 document.getElementById("liveDisconnect").addEventListener("click", async () => {
-  if (bp.client) { try { await bp.client.Disconnect(); } catch (e) {} }
+  if (bp.client) { try { await bp.client.disconnect(); } catch (e) {} }
   bp = { client: null, device: null, devKey: null, isVib: false, lastPos: null, up: false, kind: null, intifaceUrl: null };
   document.getElementById("liveDeviceLabel").style.display = "none";
   document.getElementById("liveDisconnect").style.display = "none";
   document.getElementById("liveIntifaceUrl").style.display = "";
   const ibtn = document.getElementById("liveConnectIntiface"), bbtn = document.getElementById("liveConnectBluetooth");
-  ibtn.disabled = bbtn.disabled = false; ibtn.style.display = ""; bbtn.style.display = "";
+  ibtn.disabled = false; ibtn.style.display = ""; bbtn.style.display = "";
   logLine("disconnected");
   refreshRunBtn();
 });
