@@ -70,8 +70,7 @@
   .testicon { flex: 0 0 auto; padding: .3rem .6rem; font-size: .72rem; font-weight: 400; }
 
   .labelrow { display: flex; align-items: center; gap: .8rem; }
-  .voiceicon { flex: 0 0 auto; font-size: 1.4rem; padding: .5rem .7rem; line-height: 1; transition: transform .25s ease; }
-  .voiceicon.swap { transform: scale(1.3); }
+  .voiceicon { flex: 0 0 auto; font-size: 1.4rem; padding: .5rem .7rem; line-height: 1; transition: opacity .15s ease; }
   .labelslider { display: flex; align-items: center; gap: .8rem; flex: 1 1 auto; min-height: 16vh; padding: .5rem 0; }
   .labelval {
     font-size: 2.4rem; font-weight: 700; color: var(--accent); min-width: 1.6ch; text-align: center;
@@ -149,7 +148,7 @@
     <button id="liveTestToggle" class="testicon" title="manual keypad test -- drive the toy directly with 0-9, nothing recorded">test</button>
   </div>
   <div class="labelrow">
-    <button id="voiceToggle" class="voiceicon" title="voice input -- say a number 0-9 instead of pressing the numpad">🙌</button>
+    <button id="voiceToggle" class="voiceicon" title="voice input -- say a number 0-9 instead of pressing the numpad">🎙️</button>
     <div class="labelslider">
       <div class="labelval" id="labelSliderVal">-</div>
       <input type="range" id="labelSlider" min="0" max="9" step="1" value="0" aria-label="rate your arousal 0 to 9">
@@ -1611,7 +1610,16 @@ document.getElementById("chip-sessions").querySelector(".label").addEventListene
 const LIVE_LEVEL_OF = {};
 for (let i = 0; i <= 9; i++) LIVE_LEVEL_OF["Numpad" + i] = i / 9.0;
 const liveDown = new Set(), livePressQ = [];
-function pushPress(v) { livePressQ.push(v); } // shared sink for numpad + voice + slider input
+// Shared sink for numpad + voice + slider input -- also moves the slider/readout to match
+// whatever was just pressed, so the slider works as a live confirmation for ALL three input
+// methods (say "three" with no device connected, watch the slider jump to 3 -- that's how you'd
+// know the mic heard you right, no device or session needed to test it).
+function pushPress(v) {
+  livePressQ.push(v);
+  const lvl = Math.round(v * 9);
+  document.getElementById("labelSlider").value = lvl;
+  document.getElementById("labelSliderVal").textContent = lvl;
+}
 document.addEventListener("keydown", (e) => {
   const v = LIVE_LEVEL_OF[e.code];
   if (v === undefined || liveDown.has(e.code)) return; // edge-triggered: holding a key is one press
@@ -1632,10 +1640,25 @@ const VOICE_WORD_TO_LEVEL = {
 const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
 let voiceRecognition = null, voiceActive = false;
 
-function voiceSwap(btn, label) {
-  btn.textContent = label;
-  btn.classList.add("swap");
-  setTimeout(() => btn.classList.remove("swap"), 250);
+// Icon states are the only explanation this control gets -- no help text needed to understand it:
+// mic = idle, hover swaps to a dial (hints "numbers, by voice") only while idle, a click fades
+// through a 2s "hands free!"/"back to keyboard" frame before settling on the steady stop/mic icon.
+const VOICE_MIC = "\u{1F399}️", VOICE_DIAL = "\u{1F522}", VOICE_HANDS = "\u{1F64C}",
+      VOICE_STOP = "\u{1F6D1}", VOICE_KBD = "\u{2328}️";
+let voiceHovering = false, voiceTransitioning = false;
+
+function syncVoiceIcon() {
+  if (voiceTransitioning) return; // a fade frame is showing -- don't stomp it
+  voiceBtn.textContent = voiceActive ? VOICE_STOP : (voiceHovering ? VOICE_DIAL : VOICE_MIC);
+}
+function fadeVoiceIcon(emoji, holdMs) {
+  voiceTransitioning = true;
+  voiceBtn.style.opacity = "0";
+  setTimeout(() => {
+    voiceBtn.textContent = emoji;
+    voiceBtn.style.opacity = "1";
+    setTimeout(() => { voiceTransitioning = false; syncVoiceIcon(); }, holdMs);
+  }, 150);
 }
 
 function startVoice() {
@@ -1653,7 +1676,8 @@ function startVoice() {
   voiceRecognition.onerror = (e) => {
     logLine(`voice input error: ${e.error}`);
     voiceActive = false;
-    voiceSwap(document.getElementById("voiceToggle"), "\u{1F64C}");
+    voiceTransitioning = false;
+    syncVoiceIcon();
   };
   // Some browsers stop listening after a pause even with continuous=true -- restart while the
   // toggle is still on. onerror (above) clears voiceActive first, so a real failure (e.g. denied
@@ -1667,15 +1691,17 @@ if (!SpeechRecognitionCtor) {
   voiceBtn.disabled = true;
   voiceBtn.title = "voice input isn't supported in this browser";
 } else {
+  voiceBtn.addEventListener("mouseenter", () => { voiceHovering = true; syncVoiceIcon(); });
+  voiceBtn.addEventListener("mouseleave", () => { voiceHovering = false; syncVoiceIcon(); });
   voiceBtn.addEventListener("click", () => {
     if (voiceActive) {
       voiceActive = false;
       if (voiceRecognition) voiceRecognition.stop();
-      voiceSwap(voiceBtn, "\u{1F64C}");
+      fadeVoiceIcon(VOICE_KBD, 2000);
     } else {
       voiceActive = true;
       startVoice();
-      voiceSwap(voiceBtn, "\u{1F6D1}");
+      fadeVoiceIcon(VOICE_HANDS, 2000);
     }
   });
 }
