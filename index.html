@@ -1505,7 +1505,7 @@ async function loadDefaults() {
     logLine(`could not auto-load: ${err.message}`);
     logLine(`(if this page is open via file:// -- double-clicked, not http:// -- that's expected: ` +
             `browsers block fetch() of local files from file:// pages. Either run e.g. ` +
-            `"python -m http.server" in this folder and open http://localhost:8000/cumpredict.html ` +
+            `"python -m http.server" in this folder and open http://localhost:8000/index.html ` +
             `instead, or just use "upload your own CSV" above, which doesn't need fetch() at all.)`);
   }
 }
@@ -1607,7 +1607,7 @@ is the only thing that ships; everything else was scaffolding). Regenerate on de
 1. Pull the core module out of this file and run it headless (no browser, no chrome-mcp):
      node -e '
        const fs=require("fs"), vm=require("vm");
-       const html=fs.readFileSync("cumpredict.html","utf8");
+       const html=fs.readFileSync("index.html","utf8");
        const script=[...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
        const sandbox={}; sandbox.self=sandbox; sandbox.window=sandbox;
        vm.createContext(sandbox); vm.runInContext(script, sandbox);
