@@ -143,7 +143,7 @@
   <div class="bar">
     <button id="liveConnectIntiface">connect via Intiface</button>
     <input type="text" id="liveIntifaceUrl" class="urlinput" placeholder="ws://127.0.0.1:12345" value="ws://127.0.0.1:12345">
-    <button id="liveConnectBluetooth" disabled title="not currently available -- buttplug-js dropped its direct-Bluetooth connector; only the Intiface Central/Engine relay works right now">connect via Bluetooth</button>
+    <button id="liveConnectBluetooth" title="loads a ~7MB WASM Bluetooth server on first use (not until you click this); Chrome/Edge/Opera only, HTTPS required">connect via Bluetooth</button>
     <button id="liveDisconnect" style="display:none">disconnect</button>
   </div>
   <div id="liveDeviceLabel" class="devicelabel" style="display:none">
@@ -1896,9 +1896,22 @@ function bpAttach(dev) {
   return changed;
 }
 
+// The Bluetooth connector is a ~7MB WASM-compiled server (buttplug-wasm/buttplug-wasm-blob),
+// nowhere near the size of the rest of this page -- loaded on demand via a dynamic import from
+// esm.sh (which resolves its nested "buttplug-wasm-blob"/"eventemitter3" imports; the raw npm CDN
+// files can't, they use bare specifiers a browser alone won't follow) only when Bluetooth is
+// actually clicked, not on every page load. Built against buttplug@4.x, not the 5.x this page
+// otherwise uses -- untested against real hardware; if it breaks, that's the likely reason.
+async function bpMakeBluetoothConnector() {
+  const mod = await import("https://esm.sh/buttplug-wasm@3.0.0");
+  return new mod.ButtplugWasmClientConnector();
+}
+
 async function bpConnect(kind, intifaceUrl) {
   const client = new buttplug.ButtplugClient("cumpredict");
-  const connector = new buttplug.ButtplugBrowserWebsocketClientConnector(intifaceUrl);
+  const connector = kind === "bluetooth"
+    ? await bpMakeBluetoothConnector()
+    : new buttplug.ButtplugBrowserWebsocketClientConnector(intifaceUrl);
   await client.connect(connector);
   logLine(`connected (${kind}); scanning -- power the toy on now (up to 90s)`);
   await client.startScanning();
@@ -2102,9 +2115,10 @@ function refreshRunBtn() {
 async function liveConnectClick(kind) {
   const ibtn = document.getElementById("liveConnectIntiface"), bbtn = document.getElementById("liveConnectBluetooth");
   if (typeof buttplug === "undefined") { logLine("ERROR: buttplug-js failed to load from the CDN (offline?) -- device connection isn't available."); return; }
-  ibtn.disabled = true;
+  ibtn.disabled = bbtn.disabled = true;
   try {
     const url = document.getElementById("liveIntifaceUrl").value.trim() || "ws://127.0.0.1:12345";
+    if (kind === "bluetooth") logLine("loading the Bluetooth WASM server (~7MB, first use only)...");
     await bpConnect(kind, url);
     document.getElementById("liveDeviceLabelText").textContent = `${bp.devKey} -- ${bp.isVib ? "vibration" : "linear"}`;
     document.getElementById("liveDeviceLabel").style.display = "";
@@ -2115,10 +2129,11 @@ async function liveConnectClick(kind) {
     refreshRunBtn();
   } catch (err) {
     logLine(`connect failed: ${err.message}`);
-    ibtn.disabled = false;
+    ibtn.disabled = bbtn.disabled = false;
   }
 }
 document.getElementById("liveConnectIntiface").addEventListener("click", () => liveConnectClick("intiface"));
+document.getElementById("liveConnectBluetooth").addEventListener("click", () => liveConnectClick("bluetooth"));
 
 document.getElementById("liveDisconnect").addEventListener("click", async () => {
   if (bp.client) { try { await bp.client.disconnect(); } catch (e) {} }
@@ -2127,7 +2142,7 @@ document.getElementById("liveDisconnect").addEventListener("click", async () => 
   document.getElementById("liveDisconnect").style.display = "none";
   document.getElementById("liveIntifaceUrl").style.display = "";
   const ibtn = document.getElementById("liveConnectIntiface"), bbtn = document.getElementById("liveConnectBluetooth");
-  ibtn.disabled = false; ibtn.style.display = ""; bbtn.style.display = "";
+  ibtn.disabled = bbtn.disabled = false; ibtn.style.display = ""; bbtn.style.display = "";
   logLine("disconnected");
   refreshRunBtn();
 });
