@@ -33,18 +33,21 @@
   header p { margin: 0; font-size: .82rem; color: var(--text-dim); max-width: 62ch; }
 
   .bar { display: flex; gap: .5rem; flex-wrap: wrap; }
-  button, .filebtn {
+  button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
     padding: .7rem 1rem; font: inherit; font-size: .92rem; font-weight: 600; cursor: pointer;
     border-radius: 6px; flex: 1 1 auto; text-align: center; white-space: nowrap;
   }
-  button:hover, .filebtn:hover { border-color: var(--accent); }
+  button:hover { border-color: var(--accent); }
   button:disabled { opacity: .4; cursor: not-allowed; }
   button.primary { background: var(--accent-dim); border-color: var(--accent); color: #fff2e2; }
   button.primary:hover { background: var(--accent); }
-  .filebtn input { display: none; }
 
   .progressline { font-size: .82rem; color: var(--accent); min-height: 1.2em; }
+  .checkrow { display: flex; align-items: flex-start; gap: .5rem; font-size: .78rem; color: var(--text-dim); cursor: pointer; }
+  .checkrow input { margin-top: .2rem; flex: 0 0 auto; }
+  button#cancelbtn { background: transparent; border-color: var(--bad); color: var(--bad); flex: 0 0 auto; }
+  button#cancelbtn:hover { background: var(--bad); color: #fff; }
 
   #log {
     background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
@@ -56,6 +59,10 @@
   summary { cursor: pointer; color: var(--text-dim); font-size: .82rem; }
 
   .titlerow { display: flex; align-items: center; gap: .8rem 1rem; flex-wrap: wrap; justify-content: space-between; }
+  .titlelink { display: flex; align-items: center; gap: .5rem; color: inherit; text-decoration: none; }
+  .titlelink:hover .ver { color: var(--text); }
+  .titlelink:hover .ghicon { color: var(--accent); }
+  .ghicon { color: var(--text-dim); flex: 0 0 auto; }
   .chiprow { display: flex; gap: .5rem; flex-wrap: wrap; }
   .chip {
     display: inline-flex; align-items: center; gap: .3rem;
@@ -63,8 +70,8 @@
     border-radius: 5px; padding: .3rem .5rem .3rem .65rem; font-size: .8rem; font-weight: 600;
   }
   .chip.empty { background: transparent; color: var(--text-dim); border: 1px dashed var(--line); font-weight: 400; }
-  .chip.empty.clickable { cursor: pointer; }
-  .chip.empty.clickable:hover { border-color: var(--accent); color: var(--text); }
+  .chip:hover { border-color: var(--accent); }
+  #chip-sessions .label { cursor: pointer; }
   .chip .x { background: none; border: none; color: #a5825a; cursor: pointer; font: inherit; font-size: 1rem; line-height: 1; padding: 0 0 0 .05rem; }
   .chip .x:hover { color: #fff2e2; }
   .chip.empty .x { display: none; }
@@ -73,26 +80,30 @@
 <body>
 <header>
   <div class="titlerow">
-    <h1>cumpredict <span class="ver">v0.5</span></h1>
+    <a class="titlelink" href="https://github.com/PsychoSmiley/cumpredict" target="_blank" rel="noopener">
+      <svg class="ghicon" viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <h1>cumpredict <span class="ver">v0.5</span></h1>
+    </a>
     <div class="chiprow" id="chiprow">
-      <span class="chip empty clickable" id="chip-sessions"><span class="label">sessions.csv</span><button class="x" title="clear">&times;</button></span>
+      <span class="chip empty" id="chip-sessions"><span class="label">sessions.csv</span><button class="x" title="clear">&times;</button></span>
       <span class="chip empty" id="chip-model"><span class="label">model.json</span><button class="x" title="clear">&times;</button></span>
       <span class="chip empty" id="chip-encoder"><span class="label">encoder.json</span><button class="x" title="clear">&times;</button></span>
     </div>
   </div>
   <p>Predictor + CfC encoder + RLS/Thompson policy + training, all client-side, verified against
-  the real cumpredict.py (370/370 checks; see the self-test comment at the end of this file's
-  source). Bundled data loads automatically -- clear a chip above and upload your own to train on
-  different data. No Python anywhere in this repo.</p>
+  the real cumpredict.py. Bundled data loads automatically -- click a chip above to swap in your
+  own data. No Python anywhere in this repo.</p>
 </header>
 
-<div class="bar">
-  <label class="filebtn">upload your own CSV<input type="file" id="csvfiles" accept=".csv" multiple></label>
-  <button id="selfcheck">run self-check</button>
-</div>
+<input type="file" id="csvfiles" accept=".csv" multiple hidden>
+
+<label class="checkrow"><input type="checkbox" id="refitPredictor"> also refit predictor model (slower; skipped by
+default and reuses the loaded model.json's body-dynamics params -- the encoder benefits more from
+retraining on new data than the predictor does)</label>
 
 <div class="bar">
   <button id="trainbtn" class="primary" disabled>train (fit predictor + hazard, then encoder)</button>
+  <button id="cancelbtn" style="display:none">cancel</button>
   <button id="exportbtn" style="display:none">download model.json + encoder.json</button>
 </div>
 <div id="trainprogress" class="progressline"></div>
@@ -601,6 +612,12 @@
   // for anything faster than that, so this costs them nothing.
   function yieldToUI() { return new Promise((resolve) => setTimeout(resolve, 0)); }
 
+  // Cooperative cancellation: pass opts.signal = {cancelled: false} and flip it from the UI to
+  // stop a run in progress. Checked right after every yieldToUI(), so a cancel lands within one
+  // chunk of work, not at the end of the whole fit/train call.
+  class CancelledError extends Error { constructor() { super("cancelled"); this.name = "CancelledError"; } }
+  function checkCancelled(signal) { if (signal && signal.cancelled) throw new CancelledError(); }
+
   // Gradient-free cross-entropy method: sample a population from a Gaussian, keep the elite
   // fraction, refit mean/std, repeat. bounds: array of [lo,hi] pairs. evalPop(P) -> array of
   // losses, one per candidate (lower is better). opts.onProgress(r, it, restarts, iters, bestLoss).
@@ -634,6 +651,7 @@
         if (L[idx[0]] < bestLoss) { bestLoss = L[idx[0]]; best = P[idx[0]].slice(); }
         if (opts.onProgress) opts.onProgress(r, it, restarts, iters, bestLoss);
         await yieldToUI();
+        checkCancelled(opts.signal);
       }
     }
     return { best, bestLoss };
@@ -1014,6 +1032,7 @@
       }
       if (opts.onProgress) opts.onProgress(b, n);
       await yieldToUI();
+      checkCancelled(opts.signal);
     }
     return { hist, pol, y };
   }
@@ -1309,7 +1328,7 @@
     opts = opts || {};
     const iters = opts.iters || 1500;
     const onProgress = opts.onProgress || null; // (step, iters, lastLoss) -> void, for a UI bar
-    const { hist, pol, y } = await encoderDataset(core, haz, rng, opts.datasetOpts);
+    const { hist, pol, y } = await encoderDataset(core, haz, rng, { ...opts.datasetOpts, signal: opts.signal });
     const d0 = new Director(rng, core, null, null, null); // linear modality, matches Python's default
     const descAll = descriptorsBatch(pol, d0.core, d0.rateRef);
     const polN = pol.map((p) => p.map((v, i) => (v - POLICY_LO[i]) / POLICY_SPAN[i]));
@@ -1333,7 +1352,7 @@
       opt.step();
       lastLoss = loss.data[0];
       if (onProgress && (step % 50 === 0 || step === iters - 1)) onProgress(step, iters, lastLoss);
-      if (step % 10 === 0) await yieldToUI();
+      if (step % 10 === 0) { await yieldToUI(); checkCancelled(opts.signal); }
     }
 
     // Genuinely held out: the last NV samples never entered a minibatch above (idx is drawn from
@@ -1384,7 +1403,7 @@
     interpOnRise, sessionFromRaw, parseCsvText, sessionFromFrame, loadSessionsFromCsvText,
     replayedRows, trainingSessions, augmentRaw, cumOnsets,
     CORE_BOUNDS, cem, fitCoreLoss, fitCore, fitFirstCumHazard, computeExtent, encoderDataset,
-    trainEncoder, yieldToUI,
+    trainEncoder, yieldToUI, CancelledError,
   };
 });
 /* ============================== end of inlined core.js ============================== */
@@ -1450,7 +1469,6 @@ function runSelfCheck() {
   }).join("\n") + `\n\n${pass} passed, ${fail} failed -- ${fail === 0 ? "matches Python." : "MISMATCH, do not trust this build."}`;
 }
 
-document.getElementById("selfcheck").addEventListener("click", runSelfCheck);
 
 // ---- train-from-CSV panel: fitCore -> fitFirstCumHazard -> trainEncoder, all client-side ----
 async function sha1Hex10(text) {
@@ -1536,10 +1554,19 @@ document.getElementById("chip-sessions").querySelector(".label").addEventListene
   if (document.getElementById("chip-sessions").classList.contains("empty")) document.getElementById("csvfiles").click();
 });
 
+document.getElementById("cancelbtn").addEventListener("click", () => {
+  if (activeCancelToken) { activeCancelToken.cancelled = true; logLine("\ncancelling..."); }
+});
+
+let activeCancelToken = null;
+
 document.getElementById("trainbtn").addEventListener("click", async () => {
   const C = window.CumPredict;
   const btn = document.getElementById("trainbtn"), progress = document.getElementById("trainprogress");
+  const cancelBtn = document.getElementById("cancelbtn");
+  const signal = activeCancelToken = { cancelled: false };
   btn.disabled = true;
+  cancelBtn.style.display = "";
   document.getElementById("exportbtn").style.display = "none";
   clearLog("");
   try {
@@ -1547,16 +1574,26 @@ document.getElementById("trainbtn").addEventListener("click", async () => {
     logLine(`${training.length} session(s) pass the training gates`);
     if (!training.length) throw new Error("no trainable sessions -- every session had zero keypresses");
 
-    logLine("\nfitting predictor core (CEM -- this takes a while)...");
     const rng = new C.RuntimeRNG();
-    const fitStart = Date.now();
-    const { core, loss } = await C.fitCore(training, rng, {
-      onProgress: (r, it, restarts, iters, bestLoss) => {
-        progress.textContent = `fitting core: restart ${r + 1}/${restarts}, iter ${it + 1}/${iters}, best loss ${bestLoss.toFixed(4)}`;
-      },
-    });
-    logLine(`core fit done in ${((Date.now() - fitStart) / 1000).toFixed(1)}s, loss=${loss.toFixed(4)}`);
-    logLine(JSON.stringify(core));
+    const wantRefit = document.getElementById("refitPredictor").checked;
+    let core;
+    if (!wantRefit && bundledModel) {
+      core = JSON.parse(bundledModel).core_params;
+      logLine("\nreusing the loaded model.json's predictor params (check \"also refit predictor model\" to refit instead)");
+      logLine(JSON.stringify(core));
+    } else {
+      logLine("\nfitting predictor core (CEM -- this takes a while)...");
+      const fitStart = Date.now();
+      const { core: fitted, loss } = await C.fitCore(training, rng, {
+        signal,
+        onProgress: (r, it, restarts, iters, bestLoss) => {
+          progress.textContent = `fitting core: restart ${r + 1}/${restarts}, iter ${it + 1}/${iters}, best loss ${bestLoss.toFixed(4)}`;
+        },
+      });
+      core = fitted;
+      logLine(`core fit done in ${((Date.now() - fitStart) / 1000).toFixed(1)}s, loss=${loss.toFixed(4)}`);
+      logLine(JSON.stringify(core));
+    }
 
     logLine("\nfitting first-cum hazard...");
     const { h0, sharp } = C.fitFirstCumHazard(training, core);
@@ -1565,6 +1602,7 @@ document.getElementById("trainbtn").addEventListener("click", async () => {
     logLine("\ntraining encoder (several minutes)...");
     const trainStart = Date.now();
     const result = await C.trainEncoder(core, [h0, sharp], rng, {
+      signal,
       onProgress: (step, iters, lastLoss) => {
         progress.textContent = `training encoder: step ${step}/${iters}, loss ${lastLoss.toFixed(5)}`;
       },
@@ -1581,10 +1619,12 @@ document.getElementById("trainbtn").addEventListener("click", async () => {
     document.getElementById("exportbtn").style.display = "";
     logLine(`\npredictor hash: ${predictorHash}`);
   } catch (err) {
-    logLine(`\nERROR: ${err.message}`);
-    progress.textContent = "failed.";
+    if (err instanceof C.CancelledError) { logLine("cancelled."); progress.textContent = "cancelled."; }
+    else { logLine(`\nERROR: ${err.message}`); progress.textContent = "failed."; }
   } finally {
     btn.disabled = false;
+    cancelBtn.style.display = "none";
+    activeCancelToken = null;
   }
 });
 
