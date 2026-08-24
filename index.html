@@ -126,7 +126,7 @@
     <div class="runblock">
       <button id="runbtn" class="primary" disabled title="connect a device first">run</button>
       <div class="runchecks">
-        <label class="checkrow tiny" title="the prediction feeds itself as the label; nothing is recorded"><input type="checkbox" id="autoMode"> no training label, trust the Predictor</label>
+        <label class="checkrow tiny" title="the prediction feeds itself as the label; nothing is recorded"><input type="checkbox" id="autoMode"> no input label, trust the Predictor</label>
       </div>
     </div>
   </div>
@@ -2076,6 +2076,7 @@ async function liveMainLoop(mode, signal) {
   let fails = 0, outage = 0, censored = false, A = 0.0;
   let [lo, hi, dur] = mode === "manual" ? manualAction(man) : liveDirector.nextAction();
   logLine(`--- ${mode.toUpperCase()}${sessionLabel ? " " + sessionLabel : ""} ---`);
+  if (mode === "label") logLine("rate your arousal 0-9 as you go -- numpad, say it out loud, or drag the slider below.");
   try {
     while (!signal.cancelled) {
       const ramp = (performance.now() - t0) / 1000;
