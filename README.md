@@ -6,6 +6,6 @@ The *JOI* stack contains two modules:
 - Predictor: much like weather forecasting, except it predicts your arousal level up to climax. Once you have gathered a [dataset](./sessions.csv), you can retrain it to suit you best, ladies.
 
 
-To use the demo you'll need to connect a sex toy over Web Bluetooth or an [Intiface](https://intiface.com/#intiface-central) local server. It can retrain itself on your own recorded sessions.
+To use the demo you'll need to connect a sex toy over Web Bluetooth or an [Intiface](https://intiface.com/#intiface-central) local server.
 
 - `v0.1`-`v0.4`: Python, torch, local saved model, mechanistic; `v0.2`-`v0.4` switched to liquid NN, CfC+ODE Predictor.  `v0.5`: switched to HTML.
